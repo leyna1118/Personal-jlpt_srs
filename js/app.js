@@ -247,9 +247,12 @@ function defaultState() {
     settings: { dailyNewCap: 30, activeCategories },
     cards: {},          // wordId -> {status, box, due, reps, lapses}
     retryQueue: [],      // [{wordId, availableAt}]
-    drawCounter: 0,
+    drawCounter: 0,      // 內部單調計數器,用來排 retryQueue 的時間,永遠不重置
+    pendingCard: null,   // 目前正在顯示、還沒作答完的卡,重新整理頁面要能還原,不能重抽
     newIntroducedDate: todayStr(),
     newIntroducedCount: 0,
+    todayDrawDate: todayStr(),
+    todayDrawCount: 0,   // 給畫面顯示用的「今天抽了幾張」,每天歸零
     stats: { correctStreak: 0, totalReviewed: 0 },
   };
 }
@@ -268,10 +271,23 @@ function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
 }
 function resetDailyCounterIfNeeded() {
-  if (STATE.newIntroducedDate !== todayStr()) {
-    STATE.newIntroducedDate = todayStr();
+  const t = todayStr();
+  if (STATE.newIntroducedDate !== t) {
+    STATE.newIntroducedDate = t;
     STATE.newIntroducedCount = 0;
   }
+  if (STATE.todayDrawDate !== t) {
+    STATE.todayDrawDate = t;
+    STATE.todayDrawCount = 0;
+  }
+}
+// 到期時間用「日曆日」比較,只要換日了就算到期,不用剛好等滿 24 小時,
+// 不然每天讀書時間不固定的話,前一天學的字隔天常常會「差一點沒到」而不出現。
+function isDue(dueMs) {
+  if (dueMs == null) return false;
+  const d = new Date(dueMs); d.setHours(0, 0, 0, 0);
+  const t = new Date(); t.setHours(0, 0, 0, 0);
+  return d.getTime() <= t.getTime();
 }
 
 /* ===================== 資料 ===================== */
@@ -332,13 +348,12 @@ function pickNextCard() {
     STATE.retryQueue = STATE.retryQueue.filter(r => r !== item);
     return { type: 'quiz', wordId: item.wordId };
   }
-  const now = Date.now();
   let dueIds = Object.keys(STATE.cards).filter(id => {
     const c = STATE.cards[id];
     if (c.status !== 'learning' || c.due == null) return false;
     const w = WORDS_BY_ID[id];
     if (!w || !isCategoryActive(w)) return false;
-    return c.due <= now;
+    return isDue(c.due);
   });
   if (dueIds.length) {
     dueIds.sort((a, b) => STATE.cards[a].due - STATE.cards[b].due);
@@ -347,6 +362,18 @@ function pickNextCard() {
   if (STATE.newIntroducedCount < STATE.settings.dailyNewCap) {
     const id = popNextIntroWord();
     if (id) return { type: 'intro', wordId: id };
+  }
+  // 新字額度用完了(或已經沒有新字可抽),但「學習中」還有字沒複習完 →
+  // 繼續抽學習中的字來練習,不要直接卡住不動。
+  const learningIds = Object.keys(STATE.cards).filter(id => {
+    const c = STATE.cards[id];
+    if (c.status !== 'learning') return false;
+    const w = WORDS_BY_ID[id];
+    return w && isCategoryActive(w);
+  });
+  if (learningIds.length) {
+    const id = learningIds[Math.floor(Math.random() * learningIds.length)];
+    return { type: 'quiz', wordId: id };
   }
   return null;
 }
@@ -384,9 +411,17 @@ function pickQuizType(word) {
 
 let CURRENT = null; // {mode:'intro'|'quiz', word, quizType, correctId, options, clozeInfo, answered}
 
+function pendingCardIsValid(pick) {
+  if (!pick || !pick.wordId) return false;
+  const w = WORDS_BY_ID[pick.wordId];
+  if (!w || !isCategoryActive(w)) return false;
+  if (pick.type === 'intro') return !STATE.cards[pick.wordId];
+  return pick.type === 'quiz';
+}
+
 function startCard() {
   document.getElementById('companionBar').classList.add('hidden');
-  const pick = pickNextCard();
+  resetDailyCounterIfNeeded();
   const introEl = document.getElementById('introCard');
   const quizEl = document.getElementById('quizCard');
   const emptyEl = document.getElementById('emptyState');
@@ -394,27 +429,43 @@ function startCard() {
   quizEl.classList.add('hidden');
   emptyEl.classList.add('hidden');
 
+  // 如果上一張卡還沒作答完(例如剛重新整理頁面),就繼續顯示同一張,
+  // 不重新抽新的一張 —— 不然重新整理會讓待複習/待學的字憑空消失。
+  let pick = pendingCardIsValid(STATE.pendingCard) ? STATE.pendingCard : null;
+  let isFreshDraw = false;
+  if (!pick) {
+    pick = pickNextCard();
+    isFreshDraw = true;
+  }
+
   if (!pick) {
     CURRENT = null;
+    STATE.pendingCard = null;
     emptyEl.classList.remove('hidden');
     const activeCount = WORDS.filter(isCategoryActive).length;
     if (activeCount === 0) {
       emptyEl.innerHTML = '目前沒有選取任何學習範圍。<br>請到「設定」頁勾選要背的分類。';
     } else {
-      emptyEl.innerHTML = '🎉 今天能複習的都複習完了!<br>新字額度也用完了(可以到設定調高)。<br>明天再回來繼續吧。';
+      emptyEl.innerHTML = '🎉 目前沒有可以複習或學習的字了!<br>明天再回來繼續吧。';
     }
     renderStats();
+    saveState();
     return;
   }
-  STATE.drawCounter++;
+
+  if (isFreshDraw) {
+    STATE.drawCounter++;
+    STATE.todayDrawCount++;
+    if (pick.type === 'quiz') pick.quizType = pickQuizType(WORDS_BY_ID[pick.wordId]);
+    STATE.pendingCard = pick;
+  }
 
   if (pick.type === 'intro') {
     CURRENT = { mode: 'intro', word: WORDS_BY_ID[pick.wordId] };
     renderIntroCard(CURRENT.word);
   } else {
     const word = WORDS_BY_ID[pick.wordId];
-    const quizType = pickQuizType(word);
-    CURRENT = { mode: 'quiz', word, quizType, answered: false };
+    CURRENT = { mode: 'quiz', word, quizType: pick.quizType, answered: false };
     renderQuizCard(CURRENT);
   }
   renderStats();
@@ -527,6 +578,7 @@ function submitAnswer(correct) {
   CURRENT.answered = true;
   const word = CURRENT.word;
   gradeAnswer(word.id, correct);
+  STATE.pendingCard = null;
   STATE.stats.totalReviewed++;
   STATE.stats.correctStreak = correct ? STATE.stats.correctStreak + 1 : 0;
 
@@ -591,6 +643,7 @@ function bindStaticEvents() {
     const word = CURRENT.word;
     // 「已認識」= 這個字我本來就會 → 直接進「已學會」,不再出現、也不計入今日新字額度
     STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 0, lapses: 0 };
+    STATE.pendingCard = null;
     saveState();
     startCard();
   });
@@ -601,11 +654,13 @@ function bindStaticEvents() {
     STATE.newIntroducedCount++;
     const delay = 3 + Math.floor(Math.random() * 3);
     STATE.retryQueue.push({ wordId: word.id, availableAt: STATE.drawCounter + delay });
+    STATE.pendingCard = null;
     saveState();
     startCard();
   });
   document.getElementById('masterBtn').addEventListener('click', () => {
     if (!CURRENT) return;
+    STATE.pendingCard = null;
     markMastered(CURRENT.word.id);
     startCard();
   });
@@ -653,15 +708,14 @@ function switchTab(name) {
 
 /* ===================== 統計 / 列表渲染 ===================== */
 function renderStats() {
-  document.getElementById('statDrawn').textContent = STATE.drawCounter;
+  document.getElementById('statDrawn').textContent = STATE.todayDrawCount;
   document.getElementById('statNew').textContent = STATE.newIntroducedCount + '/' + STATE.settings.dailyNewCap;
-  const now = Date.now();
   let due = 0, mastered = 0;
   for (const w of WORDS) {
     const c = STATE.cards[w.id];
     if (!c) continue;
     if (c.status === 'mastered') mastered++;
-    else if (c.status === 'learning' && c.due != null && c.due <= now && isCategoryActive(w)) due++;
+    else if (c.status === 'learning' && isDue(c.due) && isCategoryActive(w)) due++;
   }
   document.getElementById('statDue').textContent = due;
   document.getElementById('statMastered').textContent = mastered;
@@ -817,6 +871,7 @@ function importProgress(e) {
       const loaded = JSON.parse(reader.result);
       if (!loaded || typeof loaded !== 'object' || !loaded.cards) throw new Error('format');
       STATE = Object.assign(defaultState(), loaded);
+      STATE.pendingCard = null;
       saveState();
       showToast('進度匯入成功 ✅');
       buildIntroQueue();
