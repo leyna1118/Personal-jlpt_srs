@@ -2,7 +2,16 @@
   "permissions": {
     "allow": [
       "PowerShell(py *)",
-      "Bash(node -c ./js/app.js)"
+      "Bash(node -c ./js/app.js)",
+      "Bash(node --check js/app.js)",
+      "PowerShell(node --check js/app.js; if \\($?\\) { \"SYNTAX OK\" })",
+      "Bash(python3 -c ' *)",
+      "Bash(/c/Users/ennda/AppData/Local/Programs/Python/Python313/python -c ' *)",
+      "Bash(/c/Users/ennda/AppData/Local/Programs/Python/Python313/python *)",
+      "Bash(pkill -f \"http.server 8843\")",
+      "Bash(git fetch *)",
+      "Bash(git commit --amend -m ' *)",
+      "Bash(git add *)"
     ]
   }
 }

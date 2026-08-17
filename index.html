@@ -25,7 +25,7 @@
     <div class="panel stat-panel">
       <div class="stat-grid">
         <div class="stat"><b id="statDrawn">0</b><span>今天抽了幾張</span></div>
-        <div class="stat"><b id="statNew">0</b><span>今日新字 / 上限</span></div>
+        <div class="stat"><b id="statNew">0</b><span>學習中 / 上限</span></div>
         <div class="stat"><b id="statDue">0</b><span>待複習</span></div>
         <div class="stat"><b id="statMastered">0</b><span>已學會</span></div>
       </div>
@@ -37,10 +37,13 @@
       <div id="introCard" class="card-view hidden">
         <div class="card-tag">初次見面</div>
         <div class="word-main" id="introWord">-</div>
-        <div class="word-reading" id="introReading"></div>
-        <div class="word-meaning" id="introMeaning"></div>
-        <div class="word-example" id="introExample"></div>
-        <div class="intro-actions">
+        <button id="introShowBtn" class="btn small ghost">顯示讀音・意思</button>
+        <div id="introDetails" class="hidden">
+          <div class="word-reading" id="introReading"></div>
+          <div class="word-meaning" id="introMeaning"></div>
+          <div class="word-example" id="introExample"></div>
+        </div>
+        <div class="intro-actions hidden" id="introActions">
           <button id="introKnowBtn" class="btn ghost">已認識</button>
           <button id="introLearnBtn" class="btn primary">沒看過</button>
         </div>
@@ -54,7 +57,7 @@
         <div id="quizMcOptions" class="mc-options hidden"></div>
 
         <div id="quizTypeInput" class="type-input hidden">
-          <input type="text" id="typingAnswer" placeholder="輸入假名讀音" autocomplete="off" autocapitalize="off">
+          <input type="text" id="typingAnswer" placeholder="輸入假名讀音" autocomplete="off" autocapitalize="off" lang="ja" inputmode="text">
           <button id="submitTyping" class="btn primary">送出</button>
         </div>
 
@@ -65,6 +68,7 @@
             <div class="answer-reading" id="answerReading"></div>
             <div class="answer-meaning" id="answerMeaning"></div>
             <div class="answer-example" id="answerExample"></div>
+            <div class="answer-occurrence" id="answerOccurrence"></div>
           </div>
           <div class="feedback-actions">
             <button id="masterBtn" class="btn small ghost">完全會了</button>
@@ -113,13 +117,14 @@
   <!-- SETTINGS VIEW -->
   <section id="viewSettings" class="view hidden">
     <div class="panel">
-      <div class="section-title">學習範圍</div>
+      <div class="section-title">學習範圍與單字數上限</div>
       <div class="row" id="categoryChips"></div>
-    </div>
-    <div class="panel">
-      <div class="section-title">每日新字安全上限</div>
-      <p class="muted">超過這個數字就不再跳出新字介紹卡(學習中的字複習不受影響),你隨時可以調整。</p>
-      <input type="number" id="dailyCapInput" min="0" max="300" style="width:80px;">
+      <div class="cap-row">
+        <label for="dailyCapInput" style="font-size:13px;font-weight:600;">學習中單字數上限</label>
+        <input type="number" id="dailyCapInput" min="0" max="1000" style="width:80px;">
+      </div>
+      <p class="muted">同時「學習中」的單字數達到這個數字時,就不再跳出新字介紹卡;低於這個數字時才會補新字進來(已學會的字不算在內)。修改後要按「儲存設定」才會生效。</p>
+      <button id="settingsSaveBtn" class="btn primary">儲存設定</button>
     </div>
     <div class="panel">
       <div class="section-title">💾 匯出 / 匯入進度</div>

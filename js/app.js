@@ -244,13 +244,13 @@ function defaultState() {
   for (const t of TIERS) activeCategories.push(catKey('N2', t));
   return {
     version: 1,
-    settings: { dailyNewCap: 30, activeCategories },
-    cards: {},          // wordId -> {status, box, due, reps, lapses}
+    // learningCap:「學習中」單字數上限(不是每日新字數上限)。同時學習中的字數
+    // 達到這個上限就不再抽新字,低於上限時才會補新字進來。
+    settings: { learningCap: 100, activeCategories },
+    cards: {},          // wordId -> {status, box, due, reps, lapses, lastSeen}
     retryQueue: [],      // [{wordId, availableAt}]
     drawCounter: 0,      // 內部單調計數器,用來排 retryQueue 的時間,永遠不重置
     pendingCard: null,   // 目前正在顯示、還沒作答完的卡,重新整理頁面要能還原,不能重抽
-    newIntroducedDate: todayStr(),
-    newIntroducedCount: 0,
     todayDrawDate: todayStr(),
     todayDrawCount: 0,   // 給畫面顯示用的「今天抽了幾張」,每天歸零
     stats: { correctStreak: 0, totalReviewed: 0 },
@@ -260,26 +260,53 @@ let STATE = null;
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return defaultState();
+    if (!raw) return migrateState(defaultState());
     const loaded = JSON.parse(raw);
-    return Object.assign(defaultState(), loaded);
+    const merged = Object.assign(defaultState(), loaded);
+    // settings 是巢狀物件,上面的 Object.assign 只有淺層合併,舊資料裡的 settings
+    // 會整包蓋掉預設值,所以要再跟預設值合併一次,新加的欄位(如 learningCap)才不會消失。
+    merged.settings = Object.assign({}, defaultState().settings, loaded.settings || {});
+    return migrateState(merged);
   } catch (e) {
     return defaultState();
   }
+}
+// 舊存檔資料搬遷:
+// 1. dailyNewCap(每日新字上限)→ learningCap(學習中單字數上限)
+// 2. 學習中/已學會的字如果還沒有出現次數紀錄,補設成 1(至少出現過一次才會有這個狀態)
+function migrateState(state) {
+  if (state.settings.learningCap == null) {
+    state.settings.learningCap = state.settings.dailyNewCap != null ? state.settings.dailyNewCap : 100;
+  }
+  delete state.settings.dailyNewCap;
+  for (const id in state.cards) {
+    const c = state.cards[id];
+    if ((c.status === 'learning' || c.status === 'mastered') && !(c.reps >= 1)) {
+      c.reps = 1;
+    }
+  }
+  return state;
 }
 function saveState() {
   localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
 }
 function resetDailyCounterIfNeeded() {
   const t = todayStr();
-  if (STATE.newIntroducedDate !== t) {
-    STATE.newIntroducedDate = t;
-    STATE.newIntroducedCount = 0;
-  }
   if (STATE.todayDrawDate !== t) {
     STATE.todayDrawDate = t;
     STATE.todayDrawCount = 0;
   }
+}
+// 目前「學習中」且屬於已勾選學習範圍的單字數 —— 用來跟 learningCap 比較,
+// 決定還能不能再抽新字進來。
+function countActiveLearning() {
+  let n = 0;
+  for (const id in STATE.cards) {
+    if (STATE.cards[id].status !== 'learning') continue;
+    const w = WORDS_BY_ID[id];
+    if (w && isCategoryActive(w)) n++;
+  }
+  return n;
 }
 // 到期時間用「日曆日」比較,只要換日了就算到期,不用剛好等滿 24 小時,
 // 不然每天讀書時間不固定的話,前一天學的字隔天常常會「差一點沒到」而不出現。
@@ -359,7 +386,7 @@ function pickNextCard() {
     dueIds.sort((a, b) => STATE.cards[a].due - STATE.cards[b].due);
     return { type: 'quiz', wordId: dueIds[0] };
   }
-  if (STATE.newIntroducedCount < STATE.settings.dailyNewCap) {
+  if (countActiveLearning() < STATE.settings.learningCap) {
     const id = popNextIntroWord();
     if (id) return { type: 'intro', wordId: id };
   }
@@ -456,7 +483,11 @@ function startCard() {
   if (isFreshDraw) {
     STATE.drawCounter++;
     STATE.todayDrawCount++;
-    if (pick.type === 'quiz') pick.quizType = pickQuizType(WORDS_BY_ID[pick.wordId]);
+    if (pick.type === 'quiz') {
+      pick.quizType = pickQuizType(WORDS_BY_ID[pick.wordId]);
+      const c = STATE.cards[pick.wordId];
+      if (c) c.lastSeen = todayStr();
+    }
     STATE.pendingCard = pick;
   }
 
@@ -479,6 +510,20 @@ function renderIntroCard(word) {
   document.getElementById('introMeaning').textContent = word.meaning;
   const ex = (word.examples || [])[0];
   document.getElementById('introExample').textContent = ex ? (stripFurigana(ex.furi).replace(/<\/?b>/g, '') + '(' + ex.tc + ')') : '';
+
+  // 第一次見到這個字時只先顯示單字本身,按下顯示按鈕才揭曉讀音/意思/例句和判斷按鈕,
+  // 讓使用者先靠自己回想再對答案。
+  const detailsEl = document.getElementById('introDetails');
+  const actionsEl = document.getElementById('introActions');
+  const showBtn = document.getElementById('introShowBtn');
+  detailsEl.classList.add('hidden');
+  actionsEl.classList.add('hidden');
+  showBtn.classList.remove('hidden');
+  showBtn.onclick = () => {
+    detailsEl.classList.remove('hidden');
+    actionsEl.classList.remove('hidden');
+    showBtn.classList.add('hidden');
+  };
 }
 
 function renderQuizCard(cur) {
@@ -596,6 +641,8 @@ function submitAnswer(correct) {
   document.getElementById('answerMeaning').textContent = word.meaning;
   const ex = (word.examples || [])[0];
   document.getElementById('answerExample').textContent = ex ? (stripFurigana(ex.furi).replace(/<\/?b>/g, '') + '(' + ex.tc + ')') : '';
+  const seenCount = STATE.cards[word.id] ? STATE.cards[word.id].reps : 1;
+  document.getElementById('answerOccurrence').textContent = '第 ' + seenCount + ' 次出現';
 
   if (Math.random() < 0.3) showCompanionLine(correct ? 'correct' : 'wrong');
   if (STATE.stats.correctStreak > 0 && STATE.stats.correctStreak % 10 === 0) showCompanionLine('milestone');
@@ -624,6 +671,7 @@ function markMastered(wordId) {
   let c = STATE.cards[wordId] || { box: 0, reps: 0, lapses: 0 };
   c.status = 'mastered';
   c.due = null;
+  if (!(c.reps >= 1)) c.reps = 1;
   STATE.cards[wordId] = c;
   STATE.retryQueue = STATE.retryQueue.filter(r => r.wordId !== wordId);
   showCompanionLine('mastered');
@@ -641,17 +689,15 @@ document.addEventListener('DOMContentLoaded', init);
 function bindStaticEvents() {
   document.getElementById('introKnowBtn').addEventListener('click', () => {
     const word = CURRENT.word;
-    // 「已認識」= 這個字我本來就會 → 直接進「已學會」,不再出現、也不計入今日新字額度
-    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 0, lapses: 0 };
+    // 「已認識」= 這個字我本來就會 → 直接進「已學會」,不再出現、也不計入學習中上限
+    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 1, lapses: 0, lastSeen: todayStr() };
     STATE.pendingCard = null;
     saveState();
     startCard();
   });
   document.getElementById('introLearnBtn').addEventListener('click', () => {
     const word = CURRENT.word;
-    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 0, lapses: 0 };
-    resetDailyCounterIfNeeded();
-    STATE.newIntroducedCount++;
+    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 1, lapses: 0, lastSeen: todayStr() };
     const delay = 3 + Math.floor(Math.random() * 3);
     STATE.retryQueue.push({ wordId: word.id, availableAt: STATE.drawCounter + delay });
     STATE.pendingCard = null;
@@ -676,11 +722,19 @@ function bindStaticEvents() {
     ACTIVE_CAT = null;
     renderManageView();
   });
-  document.getElementById('dailyCapInput').addEventListener('change', (e) => {
+  document.getElementById('dailyCapInput').addEventListener('input', (e) => {
     let v = parseInt(e.target.value, 10);
     if (isNaN(v) || v < 0) v = 0;
-    STATE.settings.dailyNewCap = v;
+    if (PENDING_SETTINGS) PENDING_SETTINGS.learningCap = v;
+  });
+  document.getElementById('settingsSaveBtn').addEventListener('click', () => {
+    if (!PENDING_SETTINGS) return;
+    STATE.settings.activeCategories = Array.from(PENDING_SETTINGS.activeCategories);
+    STATE.settings.learningCap = PENDING_SETTINGS.learningCap;
     saveState();
+    buildIntroQueue();
+    showToast('設定已儲存 ✅');
+    renderStats();
   });
   document.getElementById('exportBtn').addEventListener('click', exportProgress);
   document.getElementById('importBtn').addEventListener('click', () => document.getElementById('importFile').click());
@@ -709,15 +763,20 @@ function switchTab(name) {
 /* ===================== 統計 / 列表渲染 ===================== */
 function renderStats() {
   document.getElementById('statDrawn').textContent = STATE.todayDrawCount;
-  document.getElementById('statNew').textContent = STATE.newIntroducedCount + '/' + STATE.settings.dailyNewCap;
-  let due = 0, mastered = 0;
+  const today = todayStr();
+  let learning = 0, mastered = 0, dueToday = 0;
   for (const w of WORDS) {
     const c = STATE.cards[w.id];
     if (!c) continue;
-    if (c.status === 'mastered') mastered++;
-    else if (c.status === 'learning' && isDue(c.due) && isCategoryActive(w)) due++;
+    if (c.status === 'mastered') { mastered++; continue; }
+    if (c.status === 'learning' && isCategoryActive(w)) {
+      learning++;
+      // 「待複習」= 背過(學習中)但今天還沒出現過的字,跟 SRS 排程的到期日是兩回事。
+      if (c.lastSeen !== today) dueToday++;
+    }
   }
-  document.getElementById('statDue').textContent = due;
+  document.getElementById('statNew').textContent = learning + '/' + STATE.settings.learningCap;
+  document.getElementById('statDue').textContent = dueToday;
   document.getElementById('statMastered').textContent = mastered;
 }
 
@@ -822,7 +881,15 @@ function renderWordList() {
     '符合條件:' + matched + '個' + (matched > MAX_RENDER ? '(已學會/學習中優先顯示,僅列出前' + MAX_RENDER + '個,可用搜尋縮小範圍)' : '');
 }
 
+// 設定頁的「學習範圍」和「單字數上限」改成同一個框框、按「儲存設定」才會真的存進 STATE,
+// 在按下去之前的勾選/輸入都只是暫存在這裡,不會影響正在進行中的學習。
+let PENDING_SETTINGS = null;
+
 function renderSettingsView() {
+  PENDING_SETTINGS = {
+    activeCategories: new Set(STATE.settings.activeCategories),
+    learningCap: STATE.settings.learningCap,
+  };
   const wrap = document.getElementById('categoryChips');
   wrap.innerHTML = '';
   for (const level of LEVELS) {
@@ -832,7 +899,7 @@ function renderSettingsView() {
       const label = document.createElement('label');
       label.className = 'chip';
       label.style.cssText = 'display:inline-flex;align-items:center;gap:6px;background:#f2ede6;border:1px solid var(--line);border-radius:999px;padding:6px 12px;font-size:13px;cursor:pointer;';
-      label.innerHTML = `<input type="checkbox" data-key="${key}" ${STATE.settings.activeCategories.includes(key) ? 'checked' : ''}>
+      label.innerHTML = `<input type="checkbox" data-key="${key}" ${PENDING_SETTINGS.activeCategories.has(key) ? 'checked' : ''}>
         <span class="badge ${LEVEL_BADGE[level]}">${level}</span> ${TIER_LABEL[tier]} (${count})`;
       wrap.appendChild(label);
     }
@@ -840,14 +907,11 @@ function renderSettingsView() {
   wrap.querySelectorAll('input[type=checkbox]').forEach(cb => {
     cb.addEventListener('change', () => {
       const key = cb.dataset.key;
-      const set = new Set(STATE.settings.activeCategories);
-      if (cb.checked) set.add(key); else set.delete(key);
-      STATE.settings.activeCategories = Array.from(set);
-      saveState();
-      buildIntroQueue();
+      if (cb.checked) PENDING_SETTINGS.activeCategories.add(key);
+      else PENDING_SETTINGS.activeCategories.delete(key);
     });
   });
-  document.getElementById('dailyCapInput').value = STATE.settings.dailyNewCap;
+  document.getElementById('dailyCapInput').value = PENDING_SETTINGS.learningCap;
 }
 
 /* ===================== 匯出 / 匯入 ===================== */
@@ -871,6 +935,8 @@ function importProgress(e) {
       const loaded = JSON.parse(reader.result);
       if (!loaded || typeof loaded !== 'object' || !loaded.cards) throw new Error('format');
       STATE = Object.assign(defaultState(), loaded);
+      STATE.settings = Object.assign({}, defaultState().settings, loaded.settings || {});
+      STATE = migrateState(STATE);
       STATE.pendingCard = null;
       saveState();
       showToast('進度匯入成功 ✅');
