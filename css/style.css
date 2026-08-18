@@ -89,7 +89,7 @@ button{font-family:inherit;cursor:pointer;}
 .toolbar{display:flex;justify-content:space-between;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:10px;}
 .filter-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap;}
 .filter-row input[type=search]{flex:1;min-width:140px;}
-input[type=search],input[type=number],input[type=text]{font-family:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:16px;background:#fff;max-width:100%;}
+input[type=search],input[type=number],input[type=text],input[type=password]{font-family:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:16px;background:#fff;max-width:100%;}
 select{font-family:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;font-size:16px;background:#fff;}
 table{width:100%;border-collapse:collapse;font-size:13px;}
 th,td{text-align:left;padding:7px 6px;border-bottom:1px solid var(--line);}

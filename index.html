@@ -127,6 +127,27 @@
       <button id="settingsSaveBtn" class="btn primary">儲存設定</button>
     </div>
     <div class="panel">
+      <div class="section-title">☁️ 雲端同步(GitHub Gist)</div>
+      <div id="syncDisconnected">
+        <p class="muted">用你自己的 GitHub 帳號當同步後端,進度存成一個私人 Gist,換瀏覽器/裝置只要貼上同一組 token 就能連到同一份進度:<br>
+          1. 到 GitHub → 右上角頭像 →「Settings」→「Developer settings」→「Personal access tokens」→「Tokens (classic)」→「Generate new token (classic)」。<br>
+          2. Note 隨便填,權限只勾「gist」,按「Generate token」。<br>
+          3. 把產生的 token 複製貼到下面,按「連接並同步」。
+        </p>
+        <div class="row">
+          <input type="password" id="syncTokenInput" placeholder="貼上 GitHub Personal Access Token" autocomplete="off" style="flex:1;min-width:220px;">
+          <button id="syncConnectBtn" class="btn primary">連接並同步</button>
+        </div>
+      </div>
+      <div id="syncConnected" class="hidden">
+        <p class="muted" id="syncStatusText">已連接</p>
+        <div class="row">
+          <button id="syncNowBtn" class="btn ghost">立即同步</button>
+          <button id="syncDisconnectBtn" class="btn ghost">取消連接</button>
+        </div>
+      </div>
+    </div>
+    <div class="panel">
       <div class="section-title">💾 匯出 / 匯入進度</div>
       <p class="muted">進度會自動存在這台電腦這個瀏覽器裡。換裝置或想備份時,可以匯出成檔案,之後再匯入回來。</p>
       <div class="row">

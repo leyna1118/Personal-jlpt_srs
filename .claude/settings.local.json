@@ -11,7 +11,8 @@
       "Bash(pkill -f \"http.server 8843\")",
       "Bash(git fetch *)",
       "Bash(git commit --amend -m ' *)",
-      "Bash(git add *)"
+      "Bash(git add *)",
+      "Bash(git commit -m ' *)"
     ]
   }
 }

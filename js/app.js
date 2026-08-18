@@ -254,6 +254,7 @@ function defaultState() {
     todayDrawDate: todayStr(),
     todayDrawCount: 0,   // 給畫面顯示用的「今天抽了幾張」,每天歸零
     stats: { correctStreak: 0, totalReviewed: 0 },
+    updatedAt: 0,        // 這份進度最後一次變動的時間,雲端同步時用來判斷本機/雲端哪份比較新
   };
 }
 let STATE = null;
@@ -288,7 +289,183 @@ function migrateState(state) {
   return state;
 }
 function saveState() {
+  STATE.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
+  scheduleCloudPush();
+}
+
+/* ===================== 雲端同步(GitHub Gist) ===================== */
+// 用使用者自己的 GitHub 帳號當同步後端:進度存成一個私人 Gist,
+// 每個瀏覽器貼上同一組 Personal Access Token 就能連到同一份。
+const GIST_FILENAME = 'jlpt-srs-progress.json';
+const GH_TOKEN_KEY = 'jlpt-srs-gh-token';
+const GH_GIST_ID_KEY = 'jlpt-srs-gh-gist-id';
+const GH_LAST_SYNC_KEY = 'jlpt-srs-gh-last-sync';
+let RESOLVED_GIST_ID = null;   // 這次頁面載入期間快取住,避免每次 push 都重新驗證一次
+let SYNC_PUSH_TIMER = null;
+
+function getGhToken() {
+  return localStorage.getItem(GH_TOKEN_KEY) || '';
+}
+
+async function ghApi(path, options) {
+  const token = getGhToken();
+  const res = await fetch('https://api.github.com' + path, Object.assign({}, options, {
+    headers: Object.assign({
+      'Accept': 'application/vnd.github+json',
+      'Authorization': 'token ' + token,
+      'Content-Type': 'application/json',
+    }, options && options.headers),
+  }));
+  if (!res.ok) {
+    const body = await res.text().catch(() => '');
+    throw new Error('GitHub API ' + res.status + ': ' + body.slice(0, 200));
+  }
+  return res.json();
+}
+
+// 找到之前建立的那個 Gist(靠固定檔名辨認,這樣換瀏覽器只要貼一樣的 token 就找得回來);
+// 找不到就建立一個新的。結果快取在 RESOLVED_GIST_ID,同一次頁面載入期間不會重複搜尋。
+async function resolveGistId() {
+  if (RESOLVED_GIST_ID) return RESOLVED_GIST_ID;
+  const cached = localStorage.getItem(GH_GIST_ID_KEY);
+  if (cached) {
+    try {
+      await ghApi('/gists/' + cached);
+      RESOLVED_GIST_ID = cached;
+      return cached;
+    } catch (e) {
+      localStorage.removeItem(GH_GIST_ID_KEY);
+    }
+  }
+  for (let page = 1; page <= 5; page++) {
+    const list = await ghApi('/gists?per_page=100&page=' + page);
+    if (!list.length) break;
+    const found = list.find(g => g.files && g.files[GIST_FILENAME]);
+    if (found) {
+      localStorage.setItem(GH_GIST_ID_KEY, found.id);
+      RESOLVED_GIST_ID = found.id;
+      return found.id;
+    }
+    if (list.length < 100) break;
+  }
+  const created = await ghApi('/gists', {
+    method: 'POST',
+    body: JSON.stringify({
+      description: 'JLPT SRS 進度同步(勿刪除)',
+      public: false,
+      files: { [GIST_FILENAME]: { content: JSON.stringify(STATE) } },
+    }),
+  });
+  localStorage.setItem(GH_GIST_ID_KEY, created.id);
+  RESOLVED_GIST_ID = created.id;
+  return created.id;
+}
+
+// 把雲端進度拉下來,只有雲端比本機新的時候才會覆蓋本機。回傳是否真的有覆蓋。
+async function cloudPull() {
+  const gistId = await resolveGistId();
+  const gist = await ghApi('/gists/' + gistId);
+  const file = gist.files && gist.files[GIST_FILENAME];
+  if (!file) return false;
+  // 進度存滿全部單字時,內容可能超過 Gist API 內嵌 content 欄位的截斷門檻(~1MB),
+  // 這時要改抓 raw_url 拿完整內容,不然讀到的是被截斷的 JSON。
+  let contentStr = file.content;
+  if (file.truncated && file.raw_url) {
+    const res = await fetch(file.raw_url);
+    contentStr = await res.text();
+  }
+  if (!contentStr) return false;
+  const remote = JSON.parse(contentStr);
+  if ((remote.updatedAt || 0) > (STATE.updatedAt || 0)) {
+    const merged = Object.assign(defaultState(), remote);
+    merged.settings = Object.assign({}, defaultState().settings, remote.settings || {});
+    STATE = migrateState(merged);
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
+    CURRENT = null;
+    buildIntroQueue();
+    return true;
+  }
+  return false;
+}
+
+async function cloudPush() {
+  const gistId = await resolveGistId();
+  await ghApi('/gists/' + gistId, {
+    method: 'PATCH',
+    body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(STATE) } } }),
+  });
+  localStorage.setItem(GH_LAST_SYNC_KEY, String(Date.now()));
+}
+
+// 每次 saveState() 都會呼叫這裡,但用 debounce 避免連續作答時瘋狂打 API,
+// 停止變動 2 秒後才真的送出去。
+function scheduleCloudPush() {
+  if (!getGhToken()) return;
+  clearTimeout(SYNC_PUSH_TIMER);
+  SYNC_PUSH_TIMER = setTimeout(() => {
+    cloudPush().then(renderSyncStatus).catch(err => {
+      console.error(err);
+      showToast('雲端同步失敗,進度仍安全存在本機');
+    });
+  }, 2000);
+}
+
+async function connectSync(token) {
+  localStorage.setItem(GH_TOKEN_KEY, token);
+  RESOLVED_GIST_ID = null;
+  try {
+    await cloudPull();
+    await cloudPush();
+    showToast('雲端同步已連接 ✅');
+    renderAll();
+  } catch (e) {
+    console.error(e);
+    localStorage.removeItem(GH_TOKEN_KEY);
+    showToast('連接失敗,請確認 token 是否正確(需要 gist 權限)');
+  }
+  renderSyncStatus();
+}
+
+// 切分頁/切 app、關分頁的瞬間,不等 debounce 了,直接把還沒送出的變動立刻推上去,
+// 減少「換裝置前剛好卡在 2 秒等待內」而漏同步的機會。
+function flushCloudPush() {
+  if (!getGhToken() || !SYNC_PUSH_TIMER) return;
+  clearTimeout(SYNC_PUSH_TIMER);
+  SYNC_PUSH_TIMER = null;
+  cloudPush().then(renderSyncStatus).catch(err => console.error(err));
+}
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') flushCloudPush();
+});
+window.addEventListener('pagehide', flushCloudPush);
+
+function disconnectSync() {
+  localStorage.removeItem(GH_TOKEN_KEY);
+  localStorage.removeItem(GH_GIST_ID_KEY);
+  localStorage.removeItem(GH_LAST_SYNC_KEY);
+  RESOLVED_GIST_ID = null;
+  clearTimeout(SYNC_PUSH_TIMER);
+  showToast('已取消雲端同步(本機進度不受影響)');
+  renderSyncStatus();
+}
+
+function renderSyncStatus() {
+  const disc = document.getElementById('syncDisconnected');
+  const conn = document.getElementById('syncConnected');
+  if (!disc || !conn) return;
+  const token = getGhToken();
+  if (token) {
+    disc.classList.add('hidden');
+    conn.classList.remove('hidden');
+    const last = localStorage.getItem(GH_LAST_SYNC_KEY);
+    document.getElementById('syncStatusText').textContent = last
+      ? '已連接 ✅ 上次同步:' + new Date(Number(last)).toLocaleString()
+      : '已連接 ✅ 尚未同步過';
+  } else {
+    disc.classList.remove('hidden');
+    conn.classList.add('hidden');
+  }
 }
 function resetDailyCounterIfNeeded() {
   const t = todayStr();
@@ -740,13 +917,41 @@ function bindStaticEvents() {
   document.getElementById('importBtn').addEventListener('click', () => document.getElementById('importFile').click());
   document.getElementById('importFile').addEventListener('change', importProgress);
   document.getElementById('resetBtn').addEventListener('click', () => {
-    if (!confirm('確定要清空所有進度嗎?這個動作無法復原,建議先匯出備份。')) return;
+    const cloudNote = getGhToken() ? '你目前有連接雲端同步,重設後空的進度也會同步覆蓋掉雲端備份。' : '';
+    if (!confirm('確定要清空所有進度嗎?這個動作無法復原,建議先匯出備份。' + cloudNote)) return;
     STATE = defaultState();
     saveState();
     showToast('已重設全部進度');
     buildIntroQueue();
     renderAll();
   });
+
+  document.getElementById('syncConnectBtn').addEventListener('click', () => {
+    const token = document.getElementById('syncTokenInput').value.trim();
+    if (!token) { showToast('請先貼上 token'); return; }
+    document.getElementById('syncTokenInput').value = '';
+    showToast('連接中…');
+    connectSync(token);
+  });
+  document.getElementById('syncNowBtn').addEventListener('click', () => {
+    showToast('同步中…');
+    cloudPull().then(changed => {
+      if (changed) renderAll();
+      return cloudPush();
+    }).then(() => {
+      showToast('同步完成 ✅');
+      renderSyncStatus();
+    }).catch(err => {
+      console.error(err);
+      showToast('同步失敗,請檢查網路或 token');
+    });
+  });
+  document.getElementById('syncDisconnectBtn').addEventListener('click', () => {
+    if (!confirm('確定要取消雲端同步嗎?本機的進度不會被刪除,只是不會再自動備份到 GitHub。')) return;
+    disconnectSync();
+  });
+
+  renderSyncStatus();
 }
 
 /* ===================== Tabs ===================== */
@@ -886,6 +1091,7 @@ function renderWordList() {
 let PENDING_SETTINGS = null;
 
 function renderSettingsView() {
+  renderSyncStatus();
   PENDING_SETTINGS = {
     activeCategories: new Set(STATE.settings.activeCategories),
     learningCap: STATE.settings.learningCap,
@@ -966,4 +1172,15 @@ async function init() {
   bindStaticEvents();
   startCard();
   showCompanionLine('open');
+  // 先用本機資料立刻畫面,雲端拉取放在背景做,拉到比較新的資料才整個重畫。
+  if (getGhToken()) {
+    try {
+      const changed = await cloudPull();
+      if (changed) renderAll();
+      renderSyncStatus();
+    } catch (e) {
+      console.error(e);
+      showToast('雲端同步暫時失敗,先用本機進度');
+    }
+  }
 }
