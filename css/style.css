@@ -50,6 +50,10 @@ button{font-family:inherit;cursor:pointer;}
 
 .quiz-stem{font-size:30px;font-weight:700;margin:6px 0 12px;min-height:40px;}
 .quiz-stem.small{font-size:18px;font-weight:500;line-height:1.7;}
+.quiz-context{font-size:13.5px;color:var(--sub);line-height:2;margin:-4px 0 14px;}
+.quiz-context rt{font-size:9.5px;color:var(--sub);}
+.quiz-context mark{background:none;color:var(--accent);font-weight:700;}
+.quiz-context-line + .quiz-context-line{margin-top:6px;}
 .mc-options{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-top:10px;}
 .mc-options button{padding:12px 8px;font-size:14px;border-radius:10px;background:#f2ede6;border:1px solid var(--line);}
 .mc-options button:hover{filter:brightness(0.97);}

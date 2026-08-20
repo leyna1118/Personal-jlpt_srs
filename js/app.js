@@ -236,6 +236,67 @@ function extractClozeTarget(furi) {
   if (!target || plain.indexOf(target) === -1) return null;
   return { plain, target, blanked: plain.replace(target, '＿＿＿') };
 }
+// 把 furi 欄位(Anki 式振假名標記 + <b> 包住的目標詞)轉成帶注音的 HTML,
+// 讓例句整句都能讀,同時把目標詞用 <mark> 標出來。
+// 來源格式裡,空白是「詞」的分隔記號(每個空白後接的漢字[讀音]算一個詞,
+// 後面黏著的送假名不算在讀音裡),所以要照空白分詞、逐詞轉換,不能整句直接去空白,
+// 不然漢字詞跟後面沒標記的假名(送假名/助詞)會黏在一起,注音位置會對不上。
+// targetMode 控制目標詞(<b> 包住的那個)怎麼顯示,句子裡其他詞一律照常顯示漢字+注音:
+//   'kanji'(預設) 正常顯示漢字+注音
+//   'reading'      只顯示讀音、不顯示漢字 —— 用在「看讀音選意思」題型,避免例句洩漏漢字
+//   'blank'        整個挖空成 ＿＿＿ —— 用在「看意思選單字」題型,當克漏字提示
+function furiganaToRubyHtml(furi, targetMode) {
+  if (!furi) return '';
+  const openIdx = furi.indexOf('<b>');
+  const closeIdx = furi.indexOf('</b>');
+  let pre = furi, mid = '', post = '';
+  if (openIdx !== -1 && closeIdx !== -1 && closeIdx > openIdx) {
+    pre = furi.slice(0, openIdx);
+    mid = furi.slice(openIdx + 3, closeIdx);
+    post = furi.slice(closeIdx + 4);
+  }
+  const tokenize = (segment) => segment.split(/\s+/).filter(Boolean).map(tok => {
+    const open = tok.indexOf('[');
+    const close = tok.indexOf(']', open);
+    if (open === -1 || close === -1) return tok;
+    const base = tok.slice(0, open);
+    const reading = tok.slice(open + 1, close);
+    const trailing = tok.slice(close + 1);
+    return '<ruby>' + base + '<rt>' + reading + '</rt></ruby>' + trailing;
+  }).join('');
+  const readingOnly = (segment) => segment.split(/\s+/).filter(Boolean).map(tok => {
+    const open = tok.indexOf('[');
+    const close = tok.indexOf(']', open);
+    if (open === -1 || close === -1) return tok;
+    const reading = tok.slice(open + 1, close);
+    const trailing = tok.slice(close + 1);
+    return reading + trailing;
+  }).join('');
+  let midHtml = '';
+  if (mid) {
+    if (targetMode === 'blank') midHtml = '＿＿＿';
+    else if (targetMode === 'reading') midHtml = readingOnly(mid);
+    else midHtml = tokenize(mid);
+  }
+  return tokenize(pre) + (mid ? '<mark>' + midHtml + '</mark>' : '') + tokenize(post);
+}
+// 隨機挑一句帶有目標詞標記的例句;quiz 的「日文選中文」用整句日文(帶注音+標色,
+// 目標詞只顯示讀音不顯示漢字),「中文選日文」除了中文翻譯,還加上日文例句的挖空
+// (目標詞挖空成 ＿＿＿,其他詞正常顯示漢字+注音)當作額外提示,讓單字都能在例句
+// 情境中出現,而不是只看單一詞條。
+function renderQuizContext(word, kind) {
+  const el = document.getElementById('quizContext');
+  const examples = (word.examples || []).filter(ex => ex.furi && ex.furi.includes('<b>') && ex.tc);
+  if (!examples.length) { el.classList.add('hidden'); el.innerHTML = ''; return; }
+  const ex = examples[Math.floor(Math.random() * examples.length)];
+  if (kind === 'jp') {
+    el.innerHTML = furiganaToRubyHtml(ex.furi, 'reading');
+  } else {
+    el.innerHTML = '<div class="quiz-context-line">' + ex.tc + '</div>'
+      + '<div class="quiz-context-line">' + furiganaToRubyHtml(ex.furi, 'blank') + '</div>';
+  }
+  el.classList.remove('hidden');
+}
 
 /* ===================== 狀態管理 ===================== */
 function defaultState() {
@@ -275,6 +336,7 @@ function loadState() {
 // 舊存檔資料搬遷:
 // 1. dailyNewCap(每日新字上限)→ learningCap(學習中單字數上限)
 // 2. 學習中/已學會的字如果還沒有出現次數紀錄,補設成 1(至少出現過一次才會有這個狀態)
+// 3. 舊資料沒有 daysCount(第幾天)紀錄,至少補設成 1
 function migrateState(state) {
   if (state.settings.learningCap == null) {
     state.settings.learningCap = state.settings.dailyNewCap != null ? state.settings.dailyNewCap : 100;
@@ -285,6 +347,7 @@ function migrateState(state) {
     if ((c.status === 'learning' || c.status === 'mastered') && !(c.reps >= 1)) {
       c.reps = 1;
     }
+    if (!(c.daysCount >= 1)) c.daysCount = 1;
   }
   return state;
 }
@@ -542,8 +605,39 @@ function popNextIntroWord() {
 }
 
 /* ===================== 抽卡邏輯 ===================== */
+// 每日優先順序:
+//   1. 今天「還沒出現過」的所有學習中字 —— 不管 SRS 到期日,一定要全部先過一輪。
+//   2. 補新字進來,直到學習中字數補到 learningCap 上限。
+//   3. 答錯等待重考的字(retryQueue,同一天內的即時複習)。
+//   4. 上面都做完了(今天該看的學習中字都看過、新字也補滿了)才輪到 SRS 到期日邏輯:
+//      到期的字優先,沒有到期字的話就隨機挑學習中的字繼續練習。
 function pickNextCard() {
   resetDailyCounterIfNeeded();
+  const today = todayStr();
+
+  let unseenIds = Object.keys(STATE.cards).filter(id => {
+    const c = STATE.cards[id];
+    if (c.status !== 'learning') return false;
+    const w = WORDS_BY_ID[id];
+    if (!w || !isCategoryActive(w)) return false;
+    return c.lastSeen !== today;
+  });
+  if (unseenIds.length) {
+    unseenIds.sort((a, b) => {
+      const da = STATE.cards[a].due, db = STATE.cards[b].due;
+      if (da == null && db == null) return 0;
+      if (da == null) return 1;
+      if (db == null) return -1;
+      return da - db;
+    });
+    return { type: 'quiz', wordId: unseenIds[0] };
+  }
+
+  if (countActiveLearning() < STATE.settings.learningCap) {
+    const id = popNextIntroWord();
+    if (id) return { type: 'intro', wordId: id };
+  }
+
   const retryReady = STATE.retryQueue
     .filter(r => r.availableAt <= STATE.drawCounter)
     .sort((a, b) => a.availableAt - b.availableAt);
@@ -552,6 +646,7 @@ function pickNextCard() {
     STATE.retryQueue = STATE.retryQueue.filter(r => r !== item);
     return { type: 'quiz', wordId: item.wordId };
   }
+
   let dueIds = Object.keys(STATE.cards).filter(id => {
     const c = STATE.cards[id];
     if (c.status !== 'learning' || c.due == null) return false;
@@ -562,10 +657,6 @@ function pickNextCard() {
   if (dueIds.length) {
     dueIds.sort((a, b) => STATE.cards[a].due - STATE.cards[b].due);
     return { type: 'quiz', wordId: dueIds[0] };
-  }
-  if (countActiveLearning() < STATE.settings.learningCap) {
-    const id = popNextIntroWord();
-    if (id) return { type: 'intro', wordId: id };
   }
   // 新字額度用完了(或已經沒有新字可抽),但「學習中」還有字沒複習完 →
   // 繼續抽學習中的字來練習,不要直接卡住不動。
@@ -663,7 +754,13 @@ function startCard() {
     if (pick.type === 'quiz') {
       pick.quizType = pickQuizType(WORDS_BY_ID[pick.wordId]);
       const c = STATE.cards[pick.wordId];
-      if (c) c.lastSeen = todayStr();
+      if (c) {
+        const today = todayStr();
+        // daysCount = 這個字實際被複習到的天數(不是出現次數),同一天內因答錯重考
+        // 而重複出現不會增加天數,只有換到新的一天才會 +1。
+        if (c.lastSeen && c.lastSeen !== today) c.daysCount = (c.daysCount || 1) + 1;
+        c.lastSeen = today;
+      }
     }
     STATE.pendingCard = pick;
   }
@@ -714,10 +811,14 @@ function renderQuizCard(cur) {
   const tagEl = document.getElementById('quizTypeTag');
   const stemEl = document.getElementById('quizStem');
   stemEl.classList.remove('small');
+  const contextEl = document.getElementById('quizContext');
+  contextEl.classList.add('hidden');
+  contextEl.innerHTML = '';
 
   if (cur.quizType === 'meaning') {
     tagEl.textContent = '看讀音選意思';
     stemEl.textContent = word.reading;
+    renderQuizContext(word, 'jp');
     const distractors = pickDistractors(word, 3, 'meaning');
     const options = shuffle([word, ...distractors]);
     cur.correctId = word.id;
@@ -734,6 +835,7 @@ function renderQuizCard(cur) {
   } else if (cur.quizType === 'word') {
     tagEl.textContent = '看意思選單字';
     stemEl.textContent = word.meaning;
+    renderQuizContext(word, 'tc');
     const distractors = pickDistractors(word, 3, 'sound');
     const options = shuffle([word, ...distractors]);
     cur.correctId = word.id;
@@ -818,8 +920,8 @@ function submitAnswer(correct) {
   document.getElementById('answerMeaning').textContent = word.meaning;
   const ex = (word.examples || [])[0];
   document.getElementById('answerExample').textContent = ex ? (stripFurigana(ex.furi).replace(/<\/?b>/g, '') + '(' + ex.tc + ')') : '';
-  const seenCount = STATE.cards[word.id] ? STATE.cards[word.id].reps : 1;
-  document.getElementById('answerOccurrence').textContent = '第 ' + seenCount + ' 次出現';
+  const seenDays = STATE.cards[word.id] ? (STATE.cards[word.id].daysCount || 1) : 1;
+  document.getElementById('answerOccurrence').textContent = '第 ' + seenDays + ' 天';
 
   if (Math.random() < 0.3) showCompanionLine(correct ? 'correct' : 'wrong');
   if (STATE.stats.correctStreak > 0 && STATE.stats.correctStreak % 10 === 0) showCompanionLine('milestone');
@@ -830,7 +932,7 @@ function submitAnswer(correct) {
 
 function gradeAnswer(wordId, correct) {
   let c = STATE.cards[wordId];
-  if (!c) { c = { status: 'learning', box: 0, due: null, reps: 0, lapses: 0 }; STATE.cards[wordId] = c; }
+  if (!c) { c = { status: 'learning', box: 0, due: null, reps: 0, lapses: 0, daysCount: 1 }; STATE.cards[wordId] = c; }
   c.reps++;
   if (correct) {
     c.box = Math.min(INTERVALS.length - 1, c.box + 1);
@@ -845,10 +947,11 @@ function gradeAnswer(wordId, correct) {
 }
 
 function markMastered(wordId) {
-  let c = STATE.cards[wordId] || { box: 0, reps: 0, lapses: 0 };
+  let c = STATE.cards[wordId] || { box: 0, reps: 0, lapses: 0, daysCount: 1 };
   c.status = 'mastered';
   c.due = null;
   if (!(c.reps >= 1)) c.reps = 1;
+  if (!(c.daysCount >= 1)) c.daysCount = 1;
   STATE.cards[wordId] = c;
   STATE.retryQueue = STATE.retryQueue.filter(r => r.wordId !== wordId);
   showCompanionLine('mastered');
@@ -867,14 +970,14 @@ function bindStaticEvents() {
   document.getElementById('introKnowBtn').addEventListener('click', () => {
     const word = CURRENT.word;
     // 「已認識」= 這個字我本來就會 → 直接進「已學會」,不再出現、也不計入學習中上限
-    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 1, lapses: 0, lastSeen: todayStr() };
+    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr() };
     STATE.pendingCard = null;
     saveState();
     startCard();
   });
   document.getElementById('introLearnBtn').addEventListener('click', () => {
     const word = CURRENT.word;
-    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 1, lapses: 0, lastSeen: todayStr() };
+    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr() };
     const delay = 3 + Math.floor(Math.random() * 3);
     STATE.retryQueue.push({ wordId: word.id, availableAt: STATE.drawCounter + delay });
     STATE.pendingCard = null;
