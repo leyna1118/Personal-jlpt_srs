@@ -873,6 +873,8 @@ function renderQuizCard(cur) {
     document.getElementById('typingAnswer').onkeydown = (e) => {
       if (e.key === 'Enter') document.getElementById('submitTyping').click();
     };
+    // 已經會念、懶得打字時用,直接當作答對
+    document.getElementById('skipTyping').onclick = () => submitAnswer(true);
   } else if (cur.quizType === 'cloze') {
     tagEl.textContent = '例句克漏字';
     const clozeOptions = (word.examples || []).map(ex => extractClozeTarget(ex.furi)).filter(Boolean);
