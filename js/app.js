@@ -213,12 +213,12 @@ function todayStr() {
   return d.getFullYear() + '-' + (d.getMonth() + 1) + '-' + d.getDate();
 }
 function catKey(level, tier) { return level + '_' + tier; }
-function showToast(msg) {
+function showToast(msg, duration) {
   const t = document.getElementById('toast');
   t.textContent = msg;
   t.classList.add('show');
   clearTimeout(showToast._t);
-  showToast._t = setTimeout(() => t.classList.remove('show'), 1600);
+  showToast._t = setTimeout(() => t.classList.remove('show'), duration || 1600);
 }
 
 // 去掉 Anki 式的振假名標記,例如「高校[こうこう]」還原成「高校」,保留 <b> 標籤
@@ -469,7 +469,7 @@ function scheduleCloudPush() {
   SYNC_PUSH_TIMER = setTimeout(() => {
     cloudPush().then(renderSyncStatus).catch(err => {
       console.error(err);
-      showToast('雲端同步失敗,進度仍安全存在本機');
+      showToast('雲端同步失敗:' + err.message, 6000);
     });
   }, 2000);
 }
@@ -485,7 +485,7 @@ async function connectSync(token) {
   } catch (e) {
     console.error(e);
     localStorage.removeItem(GH_TOKEN_KEY);
-    showToast('連接失敗,請確認 token 是否正確(需要 gist 權限)');
+    showToast('連接失敗:' + e.message, 6000);
   }
   renderSyncStatus();
 }
