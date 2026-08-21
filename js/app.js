@@ -382,7 +382,9 @@ async function ghApi(path, options) {
   }));
   if (!res.ok) {
     const body = await res.text().catch(() => '');
-    throw new Error('GitHub API ' + res.status + ': ' + body.slice(0, 200));
+    const err = new Error('GitHub API ' + res.status + ': ' + body.slice(0, 200));
+    err.status = res.status;
+    throw err;
   }
   return res.json();
 }
@@ -398,6 +400,10 @@ async function resolveGistId() {
       RESOLVED_GIST_ID = cached;
       return cached;
     } catch (e) {
+      // 只有 gist 真的被刪掉(404)才需要重新搜尋/建立;
+      // 其他錯誤(例如 403 rate limit)照樣清掉快取的話,反而會立刻觸發
+      // 更大量的「列出全部 gist + 新建」流程,讓限流雪上加霜,所以直接往外丟。
+      if (e.status !== 404) throw e;
       localStorage.removeItem(GH_GIST_ID_KEY);
     }
   }
