@@ -681,6 +681,11 @@ function pickNextCard() {
 
 /* ===================== 幹擾選項 ===================== */
 function pickDistractors(word, count, mode) {
+  // 選項顯示的文字:意思題顯示中文意思,讀音/克漏字題顯示假名讀音。
+  // 兩個不同的字剛好意思或讀音文字一模一樣的話,畫面上會出現兩個看起來相同的選項
+  // (一個對一個錯),所以要用這個文字去重複,不能只靠 word id 判斷。
+  const keyOf = mode === 'meaning' ? (w => w.meaning) : (w => w.reading);
+  const usedKeys = new Set([keyOf(word)]);
   const pool = mode === 'meaning' ? (word.synonymCandidates || []) : (word.soundAlikeCandidates || []);
   let candidates = pool.slice();
   if (word.pairWith && WORDS_BY_ID[word.pairWith] && !candidates.includes(word.pairWith)) {
@@ -688,17 +693,28 @@ function pickDistractors(word, count, mode) {
   }
   candidates = candidates.filter(id => id !== word.id && WORDS_BY_ID[id]);
   shuffle(candidates);
-  let chosen = candidates.slice(0, count);
+  const chosen = [];
+  for (const id of candidates) {
+    if (chosen.length >= count) break;
+    const w = WORDS_BY_ID[id];
+    const key = keyOf(w);
+    if (usedKeys.has(key)) continue;
+    usedKeys.add(key);
+    chosen.push(w);
+  }
   if (chosen.length < count) {
     const bucketKey = word.level + '_' + word.broadPos;
-    let bucket = (BUCKETS[bucketKey] || []).filter(w => w.id !== word.id && !chosen.includes(w.id));
+    let bucket = (BUCKETS[bucketKey] || []).filter(w => w.id !== word.id && !chosen.includes(w));
     shuffle(bucket);
     for (const w of bucket) {
       if (chosen.length >= count) break;
-      chosen.push(w.id);
+      const key = keyOf(w);
+      if (usedKeys.has(key)) continue;
+      usedKeys.add(key);
+      chosen.push(w);
     }
   }
-  return chosen.slice(0, count).map(id => WORDS_BY_ID[id]);
+  return chosen.slice(0, count);
 }
 
 /* ===================== 測驗題型 ===================== */
