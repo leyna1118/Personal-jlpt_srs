@@ -13,6 +13,7 @@
   <h1>🈶 日文單字 SRS</h1>
   <nav class="nav-tabs">
     <button id="tabStudy" class="active" data-tab="study">📖 複習</button>
+    <button id="tabTopics" data-tab="topics">🧩 主題式學習</button>
     <button id="tabManage" data-tab="manage">🗂 單字管理</button>
     <button id="tabSettings" data-tab="settings">⚙️ 設定 / 進度</button>
   </nav>
@@ -80,6 +81,65 @@
       </div>
 
       <div id="emptyState" class="empty-state hidden"></div>
+    </div>
+  </section>
+
+  <!-- TOPICS VIEW -->
+  <section id="viewTopics" class="view hidden">
+    <div class="panel" id="topicsHub">
+      <div class="section-title">選一個主題開始練習</div>
+      <div class="topic-grid">
+        <button class="topic-card" id="topicVerbConjBtn">
+          <div class="topic-icon">🔄</div>
+          <div class="topic-name">動詞變化</div>
+          <div class="topic-desc">て形・ない形・受身・可能…打字練習</div>
+        </button>
+        <div class="topic-card disabled">
+          <div class="topic-icon">🔁</div>
+          <div class="topic-name">自動詞・他動詞</div>
+          <div class="topic-desc">之後推出</div>
+        </div>
+        <div class="topic-card disabled">
+          <div class="topic-icon">🎐</div>
+          <div class="topic-name">オノマトペ</div>
+          <div class="topic-desc">之後推出</div>
+        </div>
+      </div>
+    </div>
+
+    <div id="verbConjView" class="hidden">
+      <div class="panel">
+        <button id="verbConjBackBtn" class="btn small ghost">← 回主題選單</button>
+        <div class="stat-grid" style="margin-top:12px;">
+          <div class="stat"><b id="vcStreak">0</b><span>連續答對</span></div>
+          <div class="stat"><b id="vcBest">0</b><span>最佳連續</span></div>
+          <div class="stat"><b id="vcAccuracy">0%</b><span>正確率</span></div>
+          <div class="stat"><b id="vcTotal">0</b><span>已作答</span></div>
+        </div>
+      </div>
+      <div class="panel">
+        <div class="card-view">
+          <div class="card-tag" id="vcFormTag"></div>
+          <div class="quiz-stem" id="vcStem"></div>
+          <div class="muted" id="vcMeaning"></div>
+
+          <div class="type-input" id="vcInputRow">
+            <input type="text" id="vcAnswerInput" placeholder="輸入平假名" autocomplete="off" autocapitalize="off" lang="ja" inputmode="text">
+            <button id="vcSubmitBtn" class="btn primary">送出</button>
+            <button id="vcSkipBtn" class="btn">跳過</button>
+          </div>
+
+          <div id="vcFeedback" class="quiz-feedback hidden">
+            <div class="feedback-result" id="vcFeedbackResult"></div>
+            <div class="answer-card">
+              <div class="answer-word" id="vcAnswerWord"></div>
+            </div>
+            <div class="feedback-actions">
+              <button id="vcNextBtn" class="btn primary">下一題</button>
+            </div>
+          </div>
+        </div>
+      </div>
     </div>
   </section>
 

@@ -315,6 +315,9 @@ function defaultState() {
     todayDrawDate: todayStr(),
     todayDrawCount: 0,   // 給畫面顯示用的「今天抽了幾張」,每天歸零
     stats: { correctStreak: 0, totalReviewed: 0 },
+    // 主題式學習(動詞變化等)用的簡單練習統計 —— 不排程、不分卡片,只累計正確率跟連續對答,
+    // 目標是練到反射直覺,不是長期記憶排程。
+    verbDrill: { totalAnswered: 0, totalCorrect: 0, streak: 0, best: 0 },
     updatedAt: 0,        // 這份進度最後一次變動的時間,雲端同步時用來判斷本機/雲端哪份比較新
   };
 }
@@ -354,7 +357,7 @@ function migrateState(state) {
 function saveState() {
   STATE.updatedAt = Date.now();
   localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
-  scheduleCloudPush();
+  scheduleCloudSync();
 }
 
 /* ===================== 雲端同步(GitHub Gist) ===================== */
@@ -365,7 +368,8 @@ const GH_TOKEN_KEY = 'jlpt-srs-gh-token';
 const GH_GIST_ID_KEY = 'jlpt-srs-gh-gist-id';
 const GH_LAST_SYNC_KEY = 'jlpt-srs-gh-last-sync';
 let RESOLVED_GIST_ID = null;   // 這次頁面載入期間快取住,避免每次 push 都重新驗證一次
-let SYNC_PUSH_TIMER = null;
+let SYNC_TIMER = null;
+let SYNC_IN_FLIGHT = null;     // 進行中的 cloudSync() promise,避免同時重疊觸發(例如 visible + 手動按鈕)
 
 function getGhToken() {
   return localStorage.getItem(GH_TOKEN_KEY) || '';
@@ -431,49 +435,87 @@ async function resolveGistId() {
   return created.id;
 }
 
-// 把雲端進度拉下來,只有雲端比本機新的時候才會覆蓋本機。回傳是否真的有覆蓋。
-async function cloudPull() {
-  const gistId = await resolveGistId();
-  const gist = await ghApi('/gists/' + gistId);
-  const file = gist.files && gist.files[GIST_FILENAME];
-  if (!file) return false;
-  // 進度存滿全部單字時,內容可能超過 Gist API 內嵌 content 欄位的截斷門檻(~1MB),
-  // 這時要改抓 raw_url 拿完整內容,不然讀到的是被截斷的 JSON。
-  let contentStr = file.content;
-  if (file.truncated && file.raw_url) {
-    const res = await fetch(file.raw_url);
-    contentStr = await res.text();
+// 合併本機/雲端兩份進度:每張卡片(cards[id])各自比較卡片自己的 updatedAt,
+// 誰新就用誰的 —— 而不是整包比較誰的 STATE.updatedAt 新就整包覆蓋掉另一份。
+// 這樣「電腦跟手機各自唸了不同的字」才不會有一邊的進度被整個蓋掉。
+// 其餘欄位(設定、今日抽卡數、重考佇列等)沒有逐項合併的價值,就跟著整包比較新
+// 的那一份走。
+function mergeStates(a, b) {
+  const aCards = a.cards || {}, bCards = b.cards || {};
+  const newer = (b.updatedAt || 0) >= (a.updatedAt || 0) ? b : a;
+  const merged = Object.assign(defaultState(), newer);
+  merged.settings = Object.assign({}, defaultState().settings, newer.settings || {});
+  merged.cards = {};
+  const ids = new Set([...Object.keys(aCards), ...Object.keys(bCards)]);
+  for (const id of ids) {
+    const ca = aCards[id], cb = bCards[id];
+    merged.cards[id] = (ca && cb) ? ((cb.updatedAt || 0) > (ca.updatedAt || 0) ? cb : ca) : (ca || cb);
   }
-  if (!contentStr) return false;
-  const remote = JSON.parse(contentStr);
-  if ((remote.updatedAt || 0) > (STATE.updatedAt || 0)) {
-    const merged = Object.assign(defaultState(), remote);
-    merged.settings = Object.assign({}, defaultState().settings, remote.settings || {});
-    STATE = migrateState(merged);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
-    CURRENT = null;
-    buildIntroQueue();
-    return true;
-  }
-  return false;
+  merged.updatedAt = Math.max(a.updatedAt || 0, b.updatedAt || 0);
+  return merged;
 }
 
-async function cloudPush() {
-  const gistId = await resolveGistId();
-  await ghApi('/gists/' + gistId, {
-    method: 'PATCH',
-    body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(STATE) } } }),
-  });
-  localStorage.setItem(GH_LAST_SYNC_KEY, String(Date.now()));
+// 完整同步一次:拉雲端 → 跟本機逐卡合併 → 合併結果存回本機也存回雲端。
+// 回傳本機資料是否因此有變動(給呼叫端決定要不要重畫畫面)。
+async function cloudSync() {
+  if (SYNC_IN_FLIGHT) return SYNC_IN_FLIGHT;
+  SYNC_IN_FLIGHT = (async () => {
+    const gistId = await resolveGistId();
+    const gist = await ghApi('/gists/' + gistId);
+    const file = gist.files && gist.files[GIST_FILENAME];
+    let remote = null;
+    if (file) {
+      // 進度存滿全部單字時,內容可能超過 Gist API 內嵌 content 欄位的截斷門檻(~1MB),
+      // 這時要改抓 raw_url 拿完整內容,不然讀到的是被截斷的 JSON。
+      let contentStr = file.content;
+      if (file.truncated && file.raw_url) {
+        const res = await fetch(file.raw_url);
+        contentStr = await res.text();
+      }
+      if (contentStr) remote = JSON.parse(contentStr);
+    }
+    let changed = false;
+    if (remote) {
+      const merged = migrateState(mergeStates(STATE, remote));
+      // 比較時忽略頂層 updatedAt(合併後幾乎一定會變,不代表真的有實質內容差異),
+      // 不然幾乎每次同步都會被誤判成「有變動」,一直跳「已同步其他裝置的進度」。
+      const before = Object.assign({}, STATE, { updatedAt: 0 });
+      const after = Object.assign({}, merged, { updatedAt: 0 });
+      if (JSON.stringify(after) !== JSON.stringify(before)) {
+        STATE = merged;
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(STATE));
+        CURRENT = null;
+        buildIntroQueue();
+        changed = true;
+      }
+    }
+    // 合併後的結果一律推回雲端,確保本機獨有、雲端還沒有的卡片也會補上去
+    // (不然單純比較「有沒有變」不夠 —— 本機可能有雲端沒有的新進度)。
+    await ghApi('/gists/' + gistId, {
+      method: 'PATCH',
+      body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(STATE) } } }),
+    });
+    localStorage.setItem(GH_LAST_SYNC_KEY, String(Date.now()));
+    return changed;
+  })();
+  try {
+    return await SYNC_IN_FLIGHT;
+  } finally {
+    SYNC_IN_FLIGHT = null;
+  }
 }
 
 // 每次 saveState() 都會呼叫這裡,但用 debounce 避免連續作答時瘋狂打 API,
 // 停止變動 2 秒後才真的送出去。
-function scheduleCloudPush() {
+function scheduleCloudSync() {
   if (!getGhToken()) return;
-  clearTimeout(SYNC_PUSH_TIMER);
-  SYNC_PUSH_TIMER = setTimeout(() => {
-    cloudPush().then(renderSyncStatus).catch(err => {
+  clearTimeout(SYNC_TIMER);
+  SYNC_TIMER = setTimeout(() => {
+    SYNC_TIMER = null;
+    cloudSync().then(changed => {
+      if (changed) renderAll();
+      renderSyncStatus();
+    }).catch(err => {
       console.error(err);
       showToast('雲端同步失敗:' + err.message, 6000);
     });
@@ -484,8 +526,7 @@ async function connectSync(token) {
   localStorage.setItem(GH_TOKEN_KEY, token);
   RESOLVED_GIST_ID = null;
   try {
-    await cloudPull();
-    await cloudPush();
+    await cloudSync();
     showToast('雲端同步已連接 ✅');
     renderAll();
   } catch (e) {
@@ -498,23 +539,32 @@ async function connectSync(token) {
 
 // 切分頁/切 app、關分頁的瞬間,不等 debounce 了,直接把還沒送出的變動立刻推上去,
 // 減少「換裝置前剛好卡在 2 秒等待內」而漏同步的機會。
-function flushCloudPush() {
-  if (!getGhToken() || !SYNC_PUSH_TIMER) return;
-  clearTimeout(SYNC_PUSH_TIMER);
-  SYNC_PUSH_TIMER = null;
-  cloudPush().then(renderSyncStatus).catch(err => console.error(err));
+function flushCloudSync() {
+  if (!getGhToken() || !SYNC_TIMER) return;
+  clearTimeout(SYNC_TIMER);
+  SYNC_TIMER = null;
+  cloudSync().then(renderSyncStatus).catch(err => console.error(err));
 }
 document.addEventListener('visibilitychange', () => {
-  if (document.visibilityState === 'hidden') flushCloudPush();
+  if (document.visibilityState === 'hidden') {
+    flushCloudSync();
+  } else if (document.visibilityState === 'visible' && getGhToken()) {
+    // 分頁切回來時主動拉一次雲端 —— 不然像電腦分頁開一整天沒重新整理的情況,
+    // 手機那邊在別的時段唸的進度永遠不會出現在這台電腦上,直到手動重新整理。
+    cloudSync().then(changed => {
+      if (changed) { renderAll(); showToast('已同步其他裝置的進度 ☁️'); }
+      renderSyncStatus();
+    }).catch(err => console.error(err));
+  }
 });
-window.addEventListener('pagehide', flushCloudPush);
+window.addEventListener('pagehide', flushCloudSync);
 
 function disconnectSync() {
   localStorage.removeItem(GH_TOKEN_KEY);
   localStorage.removeItem(GH_GIST_ID_KEY);
   localStorage.removeItem(GH_LAST_SYNC_KEY);
   RESOLVED_GIST_ID = null;
-  clearTimeout(SYNC_PUSH_TIMER);
+  clearTimeout(SYNC_TIMER);
   showToast('已取消雲端同步(本機進度不受影響)');
   renderSyncStatus();
 }
@@ -569,6 +619,14 @@ let WORDS_BY_ID = {};
 let BUCKETS = {}; // "level_broadPos" -> [word,...]
 let INTRO_QUEUE = [];
 let INTRO_POS = 0;
+
+let VERBS = [];
+
+async function loadVerbData() {
+  const res = await fetch('data/verbs.json');
+  const data = await res.json();
+  VERBS = data.verbs;
+}
 
 async function loadData() {
   const res = await fetch('data/vocab.json');
@@ -782,6 +840,7 @@ function startCard() {
         // 而重複出現不會增加天數,只有換到新的一天才會 +1。
         if (c.lastSeen && c.lastSeen !== today) c.daysCount = (c.daysCount || 1) + 1;
         c.lastSeen = today;
+        c.updatedAt = Date.now();
       }
     }
     STATE.pendingCard = pick;
@@ -968,6 +1027,7 @@ function gradeAnswer(wordId, correct) {
     const delay = 5 + Math.floor(Math.random() * 4);
     STATE.retryQueue.push({ wordId, availableAt: STATE.drawCounter + delay });
   }
+  c.updatedAt = Date.now();
 }
 
 function markMastered(wordId) {
@@ -976,6 +1036,7 @@ function markMastered(wordId) {
   c.due = null;
   if (!(c.reps >= 1)) c.reps = 1;
   if (!(c.daysCount >= 1)) c.daysCount = 1;
+  c.updatedAt = Date.now();
   STATE.cards[wordId] = c;
   STATE.retryQueue = STATE.retryQueue.filter(r => r.wordId !== wordId);
   showCompanionLine('mastered');
@@ -983,7 +1044,7 @@ function markMastered(wordId) {
 }
 function restoreWord(wordId) {
   let c = STATE.cards[wordId];
-  if (c) { c.status = 'learning'; if (c.due == null) c.due = Date.now(); }
+  if (c) { c.status = 'learning'; if (c.due == null) c.due = Date.now(); c.updatedAt = Date.now(); }
   saveState();
 }
 
@@ -994,14 +1055,14 @@ function bindStaticEvents() {
   document.getElementById('introKnowBtn').addEventListener('click', () => {
     const word = CURRENT.word;
     // 「已認識」= 這個字我本來就會 → 直接進「已學會」,不再出現、也不計入學習中上限
-    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr() };
+    STATE.cards[word.id] = { status: 'mastered', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr(), updatedAt: Date.now() };
     STATE.pendingCard = null;
     saveState();
     startCard();
   });
   document.getElementById('introLearnBtn').addEventListener('click', () => {
     const word = CURRENT.word;
-    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr() };
+    STATE.cards[word.id] = { status: 'learning', box: 0, due: null, reps: 1, lapses: 0, daysCount: 1, lastSeen: todayStr(), updatedAt: Date.now() };
     const delay = 3 + Math.floor(Math.random() * 3);
     STATE.retryQueue.push({ wordId: word.id, availableAt: STATE.drawCounter + delay });
     STATE.pendingCard = null;
@@ -1019,6 +1080,7 @@ function bindStaticEvents() {
   document.querySelectorAll('.nav-tabs button').forEach(btn => {
     btn.addEventListener('click', () => switchTab(btn.dataset.tab));
   });
+  bindVerbDrillEvents();
 
   document.getElementById('searchBox').addEventListener('input', renderWordList);
   document.getElementById('statusFilter').addEventListener('change', renderWordList);
@@ -1062,10 +1124,8 @@ function bindStaticEvents() {
   });
   document.getElementById('syncNowBtn').addEventListener('click', () => {
     showToast('同步中…');
-    cloudPull().then(changed => {
+    cloudSync().then(changed => {
       if (changed) renderAll();
-      return cloudPush();
-    }).then(() => {
       showToast('同步完成 ✅');
       renderSyncStatus();
     }).catch(err => {
@@ -1085,11 +1145,162 @@ function bindStaticEvents() {
 function switchTab(name) {
   document.querySelectorAll('.nav-tabs button').forEach(b => b.classList.toggle('active', b.dataset.tab === name));
   document.getElementById('viewStudy').classList.toggle('hidden', name !== 'study');
+  document.getElementById('viewTopics').classList.toggle('hidden', name !== 'topics');
   document.getElementById('viewManage').classList.toggle('hidden', name !== 'manage');
   document.getElementById('viewSettings').classList.toggle('hidden', name !== 'settings');
   if (name === 'manage') renderManageView();
   if (name === 'settings') renderSettingsView();
   if (name === 'study' && !CURRENT) startCard();
+}
+
+/* ===================== 主題式學習:動詞變化 ===================== */
+// 動詞資料另外整理成 data/verbs.json(group: 1=五段, 2=一段, 3=する類),不跟主要
+// 單字庫共用 —— 這份 N1~N3 單字庫缺食べる/来る/する這種基礎動詞,又混了不少
+// 複合動詞字尾(交う、込む之類),不適合直接拿來出變化練習。
+const SURU_TABLE = { te: 'して', nai: 'しない', ta: 'した', ukemi: 'される', kanou: 'できる', shieki: 'させる', ikou: 'しよう', ba: 'すれば' };
+const KURU_TABLE = { te: 'きて', nai: 'こない', ta: 'きた', ukemi: 'こられる', kanou: 'こられる', shieki: 'こさせる', ikou: 'こよう', ba: 'くれば' };
+const GODAN_ROWS = {
+  'う': ['わ', 'い', 'う', 'え', 'お'],
+  'く': ['か', 'き', 'く', 'け', 'こ'],
+  'ぐ': ['が', 'ぎ', 'ぐ', 'げ', 'ご'],
+  'す': ['さ', 'し', 'す', 'せ', 'そ'],
+  'つ': ['た', 'ち', 'つ', 'て', 'と'],
+  'ぬ': ['な', 'に', 'ぬ', 'ね', 'の'],
+  'ぶ': ['ば', 'び', 'ぶ', 'べ', 'ぼ'],
+  'む': ['ま', 'み', 'む', 'め', 'も'],
+  'る': ['ら', 'り', 'る', 'れ', 'ろ'],
+};
+const GODAN_TE = { 'う': 'って', 'つ': 'って', 'る': 'って', 'く': 'いて', 'ぐ': 'いで', 'ぬ': 'んで', 'ぶ': 'んで', 'む': 'んで', 'す': 'して' };
+const GODAN_TA = { 'う': 'った', 'つ': 'った', 'る': 'った', 'く': 'いた', 'ぐ': 'いだ', 'ぬ': 'んだ', 'ぶ': 'んだ', 'む': 'んだ', 'す': 'した' };
+// 語尾音便不規則、無法套用一般規則的五段動詞(目前只有「行く」)。
+const GODAN_ONBIN_EXCEPTIONS = { '行く': { te: 'いって', ta: 'いった' } };
+
+function godanStem(reading, rowIndex) {
+  const last = reading.slice(-1);
+  return reading.slice(0, -1) + GODAN_ROWS[last][rowIndex];
+}
+
+const CONJ_FORMS = [
+  { id: 'te', label: 'て形' },
+  { id: 'nai', label: 'ない形(否定)' },
+  { id: 'ta', label: 'た形(過去)' },
+  { id: 'ukemi', label: '受身形(被動)' },
+  { id: 'kanou', label: '可能形' },
+  { id: 'shieki', label: '使役形' },
+  { id: 'ikou', label: '意向形' },
+  { id: 'ba', label: 'ば形(條件)' },
+];
+
+// 依動詞的 group(1=五段/2=一段/3=する類)算出指定活用形的正確讀音;
+// 来る、する(含複合的「〜する」)另外處理,其餘照對應類別的規則變化。
+function conjugate(verb, formId) {
+  if (verb.word === '来る') return KURU_TABLE[formId];
+  if (verb.group === 3) {
+    const prefix = verb.reading.slice(0, -2); // 去掉語尾「する」
+    return prefix + SURU_TABLE[formId];
+  }
+  if (verb.group === 2) {
+    const stem = verb.reading.slice(0, -1); // 去掉語尾「る」
+    const table = { te: stem + 'て', nai: stem + 'ない', ta: stem + 'た', ukemi: stem + 'られる', kanou: stem + 'られる', shieki: stem + 'させる', ikou: stem + 'よう', ba: stem + 'れば' };
+    return table[formId];
+  }
+  // group 1(五段)
+  const last = verb.reading.slice(-1);
+  const exc = GODAN_ONBIN_EXCEPTIONS[verb.word];
+  switch (formId) {
+    case 'te': return exc ? exc.te : verb.reading.slice(0, -1) + GODAN_TE[last];
+    case 'ta': return exc ? exc.ta : verb.reading.slice(0, -1) + GODAN_TA[last];
+    case 'nai': return godanStem(verb.reading, 0) + 'ない';
+    case 'ukemi': return godanStem(verb.reading, 0) + 'れる';
+    case 'shieki': return godanStem(verb.reading, 0) + 'せる';
+    case 'kanou': return godanStem(verb.reading, 3) + 'る';
+    case 'ba': return godanStem(verb.reading, 3) + 'ば';
+    case 'ikou': return godanStem(verb.reading, 4) + 'う';
+    default: return '';
+  }
+}
+
+// 本次練習答錯的題目,間隔幾題後會再考一次;只存在記憶體裡,重新整理就重置 ——
+// 這個模式的目標是當場練到反射動作,不是像單字卡一樣長期排程記憶。
+let VC_RETRY = [];
+let VC_ASK_COUNT = 0;
+let VC_CURRENT = null; // { verb, formId }
+let VC_ANSWERED = false;
+
+function pickVerbQuestion() {
+  VC_ASK_COUNT++;
+  const dueRetryIdx = VC_RETRY.findIndex(r => r.availableAt <= VC_ASK_COUNT);
+  if (dueRetryIdx !== -1) return VC_RETRY.splice(dueRetryIdx, 1)[0].item;
+  const verb = VERBS[Math.floor(Math.random() * VERBS.length)];
+  const form = CONJ_FORMS[Math.floor(Math.random() * CONJ_FORMS.length)];
+  return { verb, formId: form.id };
+}
+
+function renderVerbDrillStats() {
+  const d = STATE.verbDrill;
+  document.getElementById('vcStreak').textContent = d.streak;
+  document.getElementById('vcBest').textContent = d.best;
+  document.getElementById('vcTotal').textContent = d.totalAnswered;
+  document.getElementById('vcAccuracy').textContent = d.totalAnswered ? Math.round(d.totalCorrect / d.totalAnswered * 100) + '%' : '0%';
+}
+
+function startVerbQuestion() {
+  VC_CURRENT = pickVerbQuestion();
+  VC_ANSWERED = false;
+  document.getElementById('vcFormTag').textContent = CONJ_FORMS.find(f => f.id === VC_CURRENT.formId).label;
+  document.getElementById('vcStem').textContent = VC_CURRENT.verb.word;
+  document.getElementById('vcMeaning').textContent = VC_CURRENT.verb.meaning;
+  document.getElementById('vcAnswerInput').value = '';
+  document.getElementById('vcInputRow').classList.remove('hidden');
+  document.getElementById('vcFeedback').classList.add('hidden');
+  document.getElementById('vcAnswerInput').focus();
+}
+
+// 跳過等同「不會、直接看答案」,計入答錯(打斷連續對答),但一樣會排進稍後重考。
+function submitVerbAnswer(correct) {
+  if (VC_ANSWERED || !VC_CURRENT) return;
+  VC_ANSWERED = true;
+  const d = STATE.verbDrill;
+  d.totalAnswered++;
+  if (correct) {
+    d.totalCorrect++;
+    d.streak++;
+    if (d.streak > d.best) d.best = d.streak;
+  } else {
+    d.streak = 0;
+    VC_RETRY.push({ item: VC_CURRENT, availableAt: VC_ASK_COUNT + 4 + Math.floor(Math.random() * 3) });
+  }
+  saveState();
+  renderVerbDrillStats();
+  document.getElementById('vcInputRow').classList.add('hidden');
+  const fb = document.getElementById('vcFeedback');
+  fb.classList.remove('hidden');
+  const resultEl = document.getElementById('vcFeedbackResult');
+  resultEl.textContent = correct ? '✅ 答對了' : '❌ 不對';
+  resultEl.className = 'feedback-result ' + (correct ? 'correct' : 'wrong');
+  document.getElementById('vcAnswerWord').textContent = conjugate(VC_CURRENT.verb, VC_CURRENT.formId);
+}
+
+function bindVerbDrillEvents() {
+  document.getElementById('topicVerbConjBtn').addEventListener('click', () => {
+    document.getElementById('topicsHub').classList.add('hidden');
+    document.getElementById('verbConjView').classList.remove('hidden');
+    renderVerbDrillStats();
+    startVerbQuestion();
+  });
+  document.getElementById('verbConjBackBtn').addEventListener('click', () => {
+    document.getElementById('verbConjView').classList.add('hidden');
+    document.getElementById('topicsHub').classList.remove('hidden');
+  });
+  document.getElementById('vcSubmitBtn').addEventListener('click', () => {
+    const val = document.getElementById('vcAnswerInput').value.trim();
+    submitVerbAnswer(val === conjugate(VC_CURRENT.verb, VC_CURRENT.formId));
+  });
+  document.getElementById('vcAnswerInput').addEventListener('keydown', (e) => {
+    if (e.key === 'Enter') document.getElementById('vcSubmitBtn').click();
+  });
+  document.getElementById('vcSkipBtn').addEventListener('click', () => submitVerbAnswer(false));
+  document.getElementById('vcNextBtn').addEventListener('click', () => startVerbQuestion());
 }
 
 /* ===================== 統計 / 列表渲染 ===================== */
@@ -1290,11 +1501,12 @@ function renderAll() {
   if (!document.getElementById('viewStudy').classList.contains('hidden')) startCard();
   if (!document.getElementById('viewManage').classList.contains('hidden')) renderManageView();
   if (!document.getElementById('viewSettings').classList.contains('hidden')) renderSettingsView();
+  if (!document.getElementById('verbConjView').classList.contains('hidden')) renderVerbDrillStats();
 }
 
 async function init() {
   STATE = loadState();
-  await loadData();
+  await Promise.all([loadData(), loadVerbData()]);
   buildIntroQueue();
   bindStaticEvents();
   startCard();
@@ -1302,7 +1514,7 @@ async function init() {
   // 先用本機資料立刻畫面,雲端拉取放在背景做,拉到比較新的資料才整個重畫。
   if (getGhToken()) {
     try {
-      const changed = await cloudPull();
+      const changed = await cloudSync();
       if (changed) renderAll();
       renderSyncStatus();
     } catch (e) {

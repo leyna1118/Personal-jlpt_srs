@@ -59,6 +59,7 @@ button{font-family:inherit;cursor:pointer;}
 .mc-options button:hover{filter:brightness(0.97);}
 .type-input{display:flex;gap:8px;justify-content:center;margin-top:10px;}
 .type-input input{font-family:inherit;font-size:16px;padding:10px 12px;border:1px solid var(--line);border-radius:8px;width:180px;}
+#vcAnswerInput{width:230px;max-width:60vw;}
 
 .quiz-feedback{margin-top:16px;padding-top:14px;border-top:1px dashed var(--line);}
 .feedback-result{font-weight:700;font-size:14px;margin-bottom:10px;}
@@ -76,6 +77,15 @@ button{font-family:inherit;cursor:pointer;}
 
 .badge{display:inline-block;font-size:11px;font-weight:700;padding:2px 7px;border-radius:6px;color:#fff;}
 .badge-n1{background:var(--n1);} .badge-n2{background:var(--n2);} .badge-n3{background:var(--n3);}
+
+.topic-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;}
+.topic-card{display:flex;flex-direction:column;align-items:center;gap:4px;background:#f2ede6;border:2px solid transparent;border-radius:12px;padding:16px 8px;text-align:center;font-family:inherit;color:var(--ink);cursor:pointer;width:100%;}
+.topic-card:hover{background:#ebe4da;}
+.topic-card .topic-icon{font-size:26px;}
+.topic-card .topic-name{font-size:13px;font-weight:700;}
+.topic-card .topic-desc{font-size:11px;color:var(--sub);line-height:1.4;}
+.topic-card.disabled{opacity:.55;cursor:default;}
+.topic-card.disabled:hover{background:#f2ede6;}
 
 .category-grid{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;}
 .category-cell{display:flex;flex-direction:column;align-items:center;gap:3px;background:#f2ede6;border:2px solid transparent;border-radius:10px;padding:10px 6px;text-align:center;font-family:inherit;color:var(--ink);cursor:pointer;width:100%;}
@@ -116,7 +126,9 @@ th{color:var(--sub);font-weight:600;font-size:12px;}
 }
 @media (max-width:420px){
   h1{font-size:18px;}
-  .nav-tabs button{font-size:12px;padding:9px 4px;}
+  .nav-tabs button{font-size:11px;padding:8px 3px;}
+  .topic-card .topic-icon{font-size:22px;}
+  .topic-card .topic-name{font-size:12px;}
   .word-main{font-size:34px;}
   .quiz-stem{font-size:24px;}
   .quiz-stem.small{font-size:16px;}
