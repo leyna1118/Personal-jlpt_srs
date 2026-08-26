@@ -368,7 +368,6 @@ const GH_TOKEN_KEY = 'jlpt-srs-gh-token';
 const GH_GIST_ID_KEY = 'jlpt-srs-gh-gist-id';
 const GH_LAST_SYNC_KEY = 'jlpt-srs-gh-last-sync';
 let RESOLVED_GIST_ID = null;   // 這次頁面載入期間快取住,避免每次 push 都重新驗證一次
-let SYNC_TIMER = null;
 let SYNC_IN_FLIGHT = null;     // 進行中的 cloudSync() promise,避免同時重疊觸發(例如 visible + 手動按鈕)
 
 function getGhToken() {
@@ -505,21 +504,36 @@ async function cloudSync() {
   }
 }
 
-// 每次 saveState() 都會呼叫這裡,但用 debounce 避免連續作答時瘋狂打 API,
-// 停止變動 2 秒後才真的送出去。
+// 每次 saveState() 都會呼叫這裡。原本是等變動停止 2 秒後才送出去(debounce),
+// 但手機瀏覽器把 app 切到背景/關掉的速度常常比這 2 秒還快,還沒送出就被系統中斷,
+// 結果「學習中/已學會」這種在快速連續作答後就切走的進度,實際上從來沒推上雲端過
+// (相對地,設定頁的變動因為使用者會留在畫面上看儲存成功的提示,debounce 才有機會
+// 跑完,所以才會出現「只有設定同步了」的現象)。
+// 改成立刻嘗試同步、不再等待;靠 cloudSync() 自己的 SYNC_IN_FLIGHT 避免同時重疊
+// 送出,如果同步進行中又有新的變動,結束後會再補跑一次,不會漏掉。
+let SYNC_DIRTY = false;
+let SYNC_LOOP_RUNNING = false;
 function scheduleCloudSync() {
   if (!getGhToken()) return;
-  clearTimeout(SYNC_TIMER);
-  SYNC_TIMER = setTimeout(() => {
-    SYNC_TIMER = null;
-    cloudSync().then(changed => {
+  SYNC_DIRTY = true;
+  runCloudSyncLoop();
+}
+async function runCloudSyncLoop() {
+  if (SYNC_LOOP_RUNNING) return;
+  SYNC_LOOP_RUNNING = true;
+  while (SYNC_DIRTY) {
+    SYNC_DIRTY = false;
+    try {
+      const changed = await cloudSync();
       if (changed) renderAll();
       renderSyncStatus();
-    }).catch(err => {
+    } catch (err) {
       console.error(err);
       showToast('雲端同步失敗:' + err.message, 6000);
-    });
-  }, 2000);
+      break; // 避免網路持續有問題時卡在無限重試迴圈,下次 saveState() 會再自然觸發一次
+    }
+  }
+  SYNC_LOOP_RUNNING = false;
 }
 
 async function connectSync(token) {
@@ -537,13 +551,11 @@ async function connectSync(token) {
   renderSyncStatus();
 }
 
-// 切分頁/切 app、關分頁的瞬間,不等 debounce 了,直接把還沒送出的變動立刻推上去,
-// 減少「換裝置前剛好卡在 2 秒等待內」而漏同步的機會。
+// 切分頁/切 app、關分頁的瞬間,萬一還有變動沒送出(理論上 scheduleCloudSync 已經
+// 立刻在跑了),保險再確認一次有沒有卡住的同步要補跑。
 function flushCloudSync() {
-  if (!getGhToken() || !SYNC_TIMER) return;
-  clearTimeout(SYNC_TIMER);
-  SYNC_TIMER = null;
-  cloudSync().then(renderSyncStatus).catch(err => console.error(err));
+  if (!getGhToken()) return;
+  runCloudSyncLoop();
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
@@ -564,7 +576,7 @@ function disconnectSync() {
   localStorage.removeItem(GH_GIST_ID_KEY);
   localStorage.removeItem(GH_LAST_SYNC_KEY);
   RESOLVED_GIST_ID = null;
-  clearTimeout(SYNC_TIMER);
+  SYNC_DIRTY = false;
   showToast('已取消雲端同步(本機進度不受影響)');
   renderSyncStatus();
 }
