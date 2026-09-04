@@ -1169,8 +1169,14 @@ function switchTab(name) {
 // 動詞資料另外整理成 data/verbs.json(group: 1=五段, 2=一段, 3=する類),不跟主要
 // 單字庫共用 —— 這份 N1~N3 單字庫缺食べる/来る/する這種基礎動詞,又混了不少
 // 複合動詞字尾(交う、込む之類),不適合直接拿來出變化練習。
-const SURU_TABLE = { te: 'して', nai: 'しない', ta: 'した', ukemi: 'される', kanou: 'できる', shieki: 'させる', ikou: 'しよう', ba: 'すれば' };
-const KURU_TABLE = { te: 'きて', nai: 'こない', ta: 'きた', ukemi: 'こられる', kanou: 'こられる', shieki: 'こさせる', ikou: 'こよう', ba: 'くれば' };
+const SURU_TABLE = {
+  te: 'して', nai: 'しない', ta: 'した', ukemi: 'される', kanou: 'できる', shieki: 'させる', ikou: 'しよう', ba: 'すれば',
+  meirei: 'しろ', shiekiukemi: 'させられる', tara: 'したら', tari: 'したり', tai: 'したい',
+};
+const KURU_TABLE = {
+  te: 'きて', nai: 'こない', ta: 'きた', ukemi: 'こられる', kanou: 'こられる', shieki: 'こさせる', ikou: 'こよう', ba: 'くれば',
+  meirei: 'こい', shiekiukemi: 'こさせられる', tara: 'きたら', tari: 'きたり', tai: 'きたい',
+};
 const GODAN_ROWS = {
   'う': ['わ', 'い', 'う', 'え', 'お'],
   'く': ['か', 'き', 'く', 'け', 'こ'],
@@ -1192,20 +1198,40 @@ function godanStem(reading, rowIndex) {
   return reading.slice(0, -1) + GODAN_ROWS[last][rowIndex];
 }
 
+// tier 依使用頻率分三層,決定抽題權重(見 TIER_WEIGHT):最常出現的 9 種、
+// 比較少的 4 種、更少的 3 種,權重分別對應約 60% / 30% / 10% 的總抽中機率。
 const CONJ_FORMS = [
-  { id: 'te', label: 'て形' },
-  { id: 'nai', label: 'ない形(否定)' },
-  { id: 'ta', label: 'た形(過去)' },
-  { id: 'ukemi', label: '受身形(被動)' },
-  { id: 'kanou', label: '可能形' },
-  { id: 'shieki', label: '使役形' },
-  { id: 'ikou', label: '意向形' },
-  { id: 'ba', label: 'ば形(條件)' },
+  { id: 'nai', label: 'ない形(否定)', tier: 1 },
+  { id: 'te', label: 'て形', tier: 1 },
+  { id: 'ta', label: 'た形(過去)', tier: 1 },
+  { id: 'kanou', label: '可能形', tier: 1 },
+  { id: 'ikou', label: '意向形(推量)', tier: 1 },
+  { id: 'meirei', label: '命令形', tier: 1 },
+  { id: 'ukemi', label: '受身形(被動)', tier: 1 },
+  { id: 'shieki', label: '使役形', tier: 1 },
+  { id: 'shiekiukemi', label: '使役受身形', tier: 1 },
+  { id: 'ba', label: 'ば形(假定)', tier: 2 },
+  { id: 'tara', label: 'たら形(過去假定)', tier: 2 },
+  { id: 'tari', label: 'たり形(並列列舉)', tier: 2 },
+  { id: 'tai', label: 'たい形(願望)', tier: 2 },
+  { id: 'kinshi', label: '禁止形(～な)', tier: 3 },
+  { id: 'tagaru', label: 'たがる形(第三人稱願望)', tier: 3 },
+  { id: 'nasai', label: 'なさい形', tier: 3 },
 ];
+const TIER_WEIGHT = { 1: 60 / 9, 2: 30 / 4, 3: 10 / 3 };
+
+// 動詞的分類標籤,用在解答頁面告訴使用者「這是哪一類動詞」。
+// 来る雖然資料裡跟する共用 group:3,但文法上是カ行變格,獨立特殊處理。
+function verbGroupLabel(verb) {
+  if (verb.word === '来る') return 'カ行變格動詞(來る,不規則)';
+  if (verb.group === 3) return verb.word === 'する' ? 'サ行變格動詞(する,不規則)' : 'サ變動詞(〜する複合動詞)';
+  if (verb.group === 2) return '二類動詞(一段動詞)';
+  return '一類動詞(五段動詞)';
+}
 
 // 依動詞的 group(1=五段/2=一段/3=する類)算出指定活用形的正確讀音;
 // 来る、する(含複合的「〜する」)另外處理,其餘照對應類別的規則變化。
-function conjugate(verb, formId) {
+function conjugateCore(verb, formId) {
   if (verb.word === '来る') return KURU_TABLE[formId];
   if (verb.group === 3) {
     const prefix = verb.reading.slice(0, -2); // 去掉語尾「する」
@@ -1213,39 +1239,96 @@ function conjugate(verb, formId) {
   }
   if (verb.group === 2) {
     const stem = verb.reading.slice(0, -1); // 去掉語尾「る」
-    const table = { te: stem + 'て', nai: stem + 'ない', ta: stem + 'た', ukemi: stem + 'られる', kanou: stem + 'られる', shieki: stem + 'させる', ikou: stem + 'よう', ba: stem + 'れば' };
+    const table = {
+      te: stem + 'て', nai: stem + 'ない', ta: stem + 'た', ukemi: stem + 'られる', kanou: stem + 'られる',
+      shieki: stem + 'させる', ikou: stem + 'よう', ba: stem + 'れば',
+      meirei: stem + 'ろ', shiekiukemi: stem + 'させられる', tara: stem + 'たら', tari: stem + 'たり', tai: stem + 'たい',
+    };
     return table[formId];
   }
   // group 1(五段)
   const last = verb.reading.slice(-1);
   const exc = GODAN_ONBIN_EXCEPTIONS[verb.word];
+  const taVal = exc ? exc.ta : verb.reading.slice(0, -1) + GODAN_TA[last];
   switch (formId) {
     case 'te': return exc ? exc.te : verb.reading.slice(0, -1) + GODAN_TE[last];
-    case 'ta': return exc ? exc.ta : verb.reading.slice(0, -1) + GODAN_TA[last];
+    case 'ta': return taVal;
+    case 'tara': return taVal + 'ら';
+    case 'tari': return taVal + 'り';
     case 'nai': return godanStem(verb.reading, 0) + 'ない';
     case 'ukemi': return godanStem(verb.reading, 0) + 'れる';
     case 'shieki': return godanStem(verb.reading, 0) + 'せる';
+    // す行五段動詞(話す等)使役受身不縮約,避免さ+され的怪音;其餘縮約成「あ段+される」。
+    case 'shiekiukemi': return last === 'す' ? godanStem(verb.reading, 0) + 'せられる' : godanStem(verb.reading, 0) + 'される';
     case 'kanou': return godanStem(verb.reading, 3) + 'る';
     case 'ba': return godanStem(verb.reading, 3) + 'ば';
     case 'ikou': return godanStem(verb.reading, 4) + 'う';
+    case 'meirei': return godanStem(verb.reading, 3);
+    case 'tai': return godanStem(verb.reading, 1) + 'たい';
     default: return '';
   }
 }
+
+// 禁止形是辭書形直接加「な」,跟動詞類別無關,所有 group 共用同一條規則。
+// たがる形、なさい形則是「たい形」去掉語尾「たい」後接的字尾,借用 tai 的結果推導,不用另外開表。
+function conjugate(verb, formId) {
+  if (formId === 'kinshi') return verb.reading + 'な';
+  if (formId === 'tagaru' || formId === 'nasai') {
+    const taiStem = conjugateCore(verb, 'tai').slice(0, -2);
+    return formId === 'tagaru' ? taiStem + 'たがる' : taiStem + 'なさい';
+  }
+  return conjugateCore(verb, formId);
+}
+
+// 每種活用形配的填空句型,{blank}是要填入該活用形的地方;句型刻意不帶特定受詞,
+// 因為同一句型要套用在及物(食べる)、不及物(行く)、する複合動詞等所有動詞上都要文法正確。
+// 常出現的 9 種形各給 2 個句型增加變化,較少見的形給 1 個就好,控制範圍。
+const SENTENCE_TEMPLATES = {
+  nai: ['きょうは{blank}。', 'たぶん{blank}。'],
+  te: ['{blank}ください。', '{blank}みてください。'],
+  ta: ['きのう、{blank}。', 'もう{blank}。'],
+  kanou: ['わたしは{blank}。', 'だれでも{blank}。'],
+  ikou: ['いっしょに{blank}。', 'さあ、{blank}。'],
+  meirei: ['はやく{blank}。', 'だまって{blank}。'],
+  ukemi: ['先生に{blank}。', 'みんなに{blank}。'],
+  shieki: ['子どもに{blank}。', '先生が{blank}。'],
+  shiekiukemi: ['母に{blank}。', 'いつも{blank}。'],
+  ba: ['{blank}、いいです。'],
+  tara: ['{blank}、教えてください。'],
+  tari: ['休みの日は、{blank}、掃除したりします。'],
+  tai: ['{blank}です。'],
+  kinshi: ['危ないから、{blank}。'],
+  tagaru: ['子どもは{blank}。'],
+  nasai: ['そろそろ{blank}。'],
+};
 
 // 本次練習答錯的題目,間隔幾題後會再考一次;只存在記憶體裡,重新整理就重置 ——
 // 這個模式的目標是當場練到反射動作,不是像單字卡一樣長期排程記憶。
 let VC_RETRY = [];
 let VC_ASK_COUNT = 0;
-let VC_CURRENT = null; // { verb, formId }
+let VC_CURRENT = null; // { verb, formId, template }
 let VC_ANSWERED = false;
+
+// 依 TIER_WEIGHT 做加權隨機抽形:層級權重總和內取亂數,依序扣減直到落在該形上。
+function pickWeightedForm() {
+  const total = CONJ_FORMS.reduce((s, f) => s + TIER_WEIGHT[f.tier], 0);
+  let r = Math.random() * total;
+  for (const f of CONJ_FORMS) {
+    r -= TIER_WEIGHT[f.tier];
+    if (r <= 0) return f;
+  }
+  return CONJ_FORMS[CONJ_FORMS.length - 1];
+}
 
 function pickVerbQuestion() {
   VC_ASK_COUNT++;
   const dueRetryIdx = VC_RETRY.findIndex(r => r.availableAt <= VC_ASK_COUNT);
   if (dueRetryIdx !== -1) return VC_RETRY.splice(dueRetryIdx, 1)[0].item;
   const verb = VERBS[Math.floor(Math.random() * VERBS.length)];
-  const form = CONJ_FORMS[Math.floor(Math.random() * CONJ_FORMS.length)];
-  return { verb, formId: form.id };
+  const form = pickWeightedForm();
+  const templates = SENTENCE_TEMPLATES[form.id];
+  const template = templates[Math.floor(Math.random() * templates.length)];
+  return { verb, formId: form.id, template };
 }
 
 function renderVerbDrillStats() {
@@ -1259,9 +1342,10 @@ function renderVerbDrillStats() {
 function startVerbQuestion() {
   VC_CURRENT = pickVerbQuestion();
   VC_ANSWERED = false;
+  const { verb, template } = VC_CURRENT;
   document.getElementById('vcFormTag').textContent = CONJ_FORMS.find(f => f.id === VC_CURRENT.formId).label;
-  document.getElementById('vcStem').textContent = VC_CURRENT.verb.word;
-  document.getElementById('vcMeaning').textContent = VC_CURRENT.verb.meaning;
+  document.getElementById('vcStem').textContent = template.replace('{blank}', '＿＿＿＿');
+  document.getElementById('vcMeaning').textContent = `${verb.word}(${verb.reading}) - ${verb.meaning}`;
   document.getElementById('vcAnswerInput').value = '';
   document.getElementById('vcInputRow').classList.remove('hidden');
   document.getElementById('vcFeedback').classList.add('hidden');
@@ -1290,7 +1374,9 @@ function submitVerbAnswer(correct) {
   const resultEl = document.getElementById('vcFeedbackResult');
   resultEl.textContent = correct ? '✅ 答對了' : '❌ 不對';
   resultEl.className = 'feedback-result ' + (correct ? 'correct' : 'wrong');
-  document.getElementById('vcAnswerWord').textContent = conjugate(VC_CURRENT.verb, VC_CURRENT.formId);
+  const answer = conjugate(VC_CURRENT.verb, VC_CURRENT.formId);
+  document.getElementById('vcAnswerWord').textContent = VC_CURRENT.template.replace('{blank}', answer);
+  document.getElementById('vcAnswerGroup').textContent = `${VC_CURRENT.verb.word} → ${verbGroupLabel(VC_CURRENT.verb)}`;
 }
 
 function bindVerbDrillEvents() {
