@@ -1409,6 +1409,60 @@ function conjugate(verb, formId) {
   return conjugateCore(verb, formId);
 }
 
+// 把讀音答案換算成漢字寫法(如果這個動詞本身是「漢字+送假名」寫成的),讓使用者
+// 用漢字打答案也算對。原理:每種活用形都是「語幹不變、只替換/加上語尾假名」,
+// 而送假名(語尾)不管漢字寫法還是讀音寫法一定逐字相同,差別只在語幹要用幾個
+// 漢字表示——所以只要抓出「讀音結果」跟「原本讀音」的共同前綴,前綴以後就是
+// 新語尾;讀音語幹被換掉的字數,從漢字寫法尾端去掉一樣多字,接上同一段新語尾
+// 就是漢字答案。来る比較特殊(語幹讀音本身在く/き/こ之間變,不是單純語尾替換
+// 的問題),用固定對照表另外處理。
+function conjugateKanji(verb, formId) {
+  if (verb.word === verb.reading) return null; // 整個動詞就是假名寫的,沒有額外的漢字答案
+  if (verb.word === '来る') {
+    if (formId === 'kinshi') return '来るな';
+    if (formId === 'tagaru') return '来たがる';
+    if (formId === 'nasai') return '来なさい';
+    return '来' + KURU_TABLE[formId].slice(1);
+  }
+  const readingResult = conjugate(verb, formId);
+  let common = 0;
+  const maxCommon = Math.min(verb.reading.length, readingResult.length);
+  while (common < maxCommon && verb.reading[common] === readingResult[common]) common++;
+  const removed = verb.reading.length - common;
+  if (removed > verb.word.length) return null; // 算出來不合理就不提供漢字答案,保守起見
+  return verb.word.slice(0, verb.word.length - removed) + readingResult.slice(common);
+}
+
+/* -------- 提示:告訴使用者這是第幾類動詞,並示範這一類怎麼變化 -------- */
+// 每一類固定挑 1-2 個常見字當示範,而不是依題目動詞的詞尾動態挑選 —— 好處是
+// 簡單好維護,缺點是五段動詞的て形/た形類(有音便)可能跟題目詞尾對不上,所以
+// 另外用 GODAN_ONBIN_HINT_NOTE 補充文字說明其他詞尾的對應方式。挑例字時會避開
+// 跟題目本身同一個字,不然示範就直接等於洩漏答案了。
+const HINT_EXAMPLES = {
+  1: [{ word: '買う', reading: 'かう', group: 1 }, { word: '読む', reading: 'よむ', group: 1 }],
+  2: [{ word: '食べる', reading: 'たべる', group: 2 }, { word: '見る', reading: 'みる', group: 2 }],
+  3: [{ word: 'する', reading: 'する', group: 3 }, { word: '勉強する', reading: 'べんきょうする', group: 3 }],
+};
+const GODAN_ONBIN_HINT_FORMS = new Set(['te', 'ta', 'tara', 'tari']);
+const GODAN_ONBIN_HINT_NOTE = '五段動詞這個形會因辭書形語尾假名不同而不一樣:う/つ/る→って(った);く→いて(いた);ぐ→いで(いだ);ぬ/ぶ/む→んで(んだ);す→して(した)。下面只示範「う」結尾的情況,其他詞尾請照這個對照套用。';
+
+function pickHintExample(group, currentWord) {
+  const list = HINT_EXAMPLES[group] || [];
+  return list.find(v => v.word !== currentWord) || list[0];
+}
+
+// 回傳這一題提示要顯示的內容:動詞類別 + 示範例字的變化 + (五段て/た形類)額外的詞尾對照說明。
+function buildVerbHint(verb, formId) {
+  const groupLabel = verbGroupLabel(verb);
+  if (verb.word === '来る') {
+    return { groupLabel, note: '來る是不規則動詞,日文裡只有這一個字這樣變(語幹讀音會在く/き/こ之間變化),沒有通用規則可以套用,建議直接把整組活用形背起來。' };
+  }
+  const example = pickHintExample(verb.group, verb.word);
+  const demoAnswer = conjugate(example, formId);
+  const note = (verb.group === 1 && GODAN_ONBIN_HINT_FORMS.has(formId)) ? GODAN_ONBIN_HINT_NOTE : '';
+  return { groupLabel, demoWord: example.word, demoAnswer, note };
+}
+
 // 每種活用形配的填空句型,{blank}是要填入該活用形的地方;句型刻意不帶特定受詞,
 // 因為同一句型要套用在及物(食べる)、不及物(行く)、する複合動詞等所有動詞上都要文法正確。
 // 常出現的 9 種形各給 2 個句型增加變化,較少見的形給 1 個就好,控制範圍。
@@ -1478,7 +1532,31 @@ function startVerbQuestion() {
   document.getElementById('vcAnswerInput').value = '';
   document.getElementById('vcInputRow').classList.remove('hidden');
   document.getElementById('vcFeedback').classList.add('hidden');
+  document.getElementById('vcHintPanel').classList.add('hidden');
   document.getElementById('vcAnswerInput').focus();
+}
+
+// 用漢字或讀音打答案都算對(見 conjugateKanji 的說明)。
+function isVerbAnswerCorrect(val) {
+  if (!VC_CURRENT) return false;
+  if (val === conjugate(VC_CURRENT.verb, VC_CURRENT.formId)) return true;
+  const kanji = conjugateKanji(VC_CURRENT.verb, VC_CURRENT.formId);
+  return kanji != null && val === kanji;
+}
+
+// 按提示不計入作答、不影響連續對答/正確率,純粹顯示說明,可以按幾次都沒關係。
+function showVerbHint() {
+  if (!VC_CURRENT) return;
+  const hint = buildVerbHint(VC_CURRENT.verb, VC_CURRENT.formId);
+  let text = `這是「${hint.groupLabel}」。`;
+  if (hint.demoWord) {
+    const formLabel = CONJ_FORMS.find(f => f.id === VC_CURRENT.formId).label;
+    text += `示範:${hint.demoWord} → ${hint.demoAnswer}(${formLabel})`;
+  }
+  if (hint.note) text += ' ' + hint.note;
+  const panel = document.getElementById('vcHintPanel');
+  panel.textContent = text;
+  panel.classList.remove('hidden');
 }
 
 // 跳過等同「不會、直接看答案」,計入答錯(打斷連續對答),但一樣會排進稍後重考。
@@ -1505,7 +1583,9 @@ function submitVerbAnswer(correct) {
   resultEl.className = 'feedback-result ' + (correct ? 'correct' : 'wrong');
   const answer = conjugate(VC_CURRENT.verb, VC_CURRENT.formId);
   document.getElementById('vcAnswerWord').textContent = VC_CURRENT.template.replace('{blank}', answer);
-  document.getElementById('vcAnswerGroup').textContent = `${VC_CURRENT.verb.word} → ${verbGroupLabel(VC_CURRENT.verb)}`;
+  const kanji = conjugateKanji(VC_CURRENT.verb, VC_CURRENT.formId);
+  const kanjiNote = (kanji && kanji !== answer) ? `(漢字也可以寫成:${kanji})` : '';
+  document.getElementById('vcAnswerGroup').textContent = `${VC_CURRENT.verb.word} → ${verbGroupLabel(VC_CURRENT.verb)}${kanjiNote}`;
 }
 
 function bindVerbDrillEvents() {
@@ -1521,12 +1601,13 @@ function bindVerbDrillEvents() {
   });
   document.getElementById('vcSubmitBtn').addEventListener('click', () => {
     const val = document.getElementById('vcAnswerInput').value.trim();
-    submitVerbAnswer(val === conjugate(VC_CURRENT.verb, VC_CURRENT.formId));
+    submitVerbAnswer(isVerbAnswerCorrect(val));
   });
   document.getElementById('vcAnswerInput').addEventListener('keydown', (e) => {
     if (e.key === 'Enter') document.getElementById('vcSubmitBtn').click();
   });
   document.getElementById('vcSkipBtn').addEventListener('click', () => submitVerbAnswer(false));
+  document.getElementById('vcHintBtn').addEventListener('click', showVerbHint);
   document.getElementById('vcNextBtn').addEventListener('click', () => startVerbQuestion());
 }
 

@@ -124,10 +124,12 @@
           <div class="muted" id="vcMeaning"></div>
 
           <div class="type-input" id="vcInputRow">
-            <input type="text" id="vcAnswerInput" placeholder="輸入空格處的平假名" autocomplete="off" autocapitalize="off" lang="ja" inputmode="text">
+            <input type="text" id="vcAnswerInput" placeholder="輸入空格處的假名或漢字" autocomplete="off" autocapitalize="off" lang="ja" inputmode="text">
             <button id="vcSubmitBtn" class="btn primary">送出</button>
             <button id="vcSkipBtn" class="btn">跳過</button>
+            <button id="vcHintBtn" class="btn ghost">提示</button>
           </div>
+          <div id="vcHintPanel" class="muted hidden" style="margin-top:8px;"></div>
 
           <div id="vcFeedback" class="quiz-feedback hidden">
             <div class="feedback-result" id="vcFeedbackResult"></div>
