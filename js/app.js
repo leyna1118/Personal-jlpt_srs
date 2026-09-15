@@ -367,8 +367,15 @@ const GIST_FILENAME = 'jlpt-srs-progress.json';
 const GH_TOKEN_KEY = 'jlpt-srs-gh-token';
 const GH_GIST_ID_KEY = 'jlpt-srs-gh-gist-id';
 const GH_LAST_SYNC_KEY = 'jlpt-srs-gh-last-sync';
+const GH_COOLDOWN_KEY = 'jlpt-srs-gh-cooldown-until';
+const GH_SYNC_LOG_KEY = 'jlpt-srs-gh-sync-log';
+const SYNC_LOG_MAX = 10;
+const SYNC_DEBOUNCE_MS = 6000;        // 平常作答停下來多久才送出一次輕量同步
+const SYNC_DEBOUNCE_MAX_WAIT_MS = 20000; // 就算連續作答不停,最多等這麼久還是會送一次,不會無限延後
+const RATE_LIMIT_COOLDOWN_MS = 10 * 60 * 1000; // 踩到限流後,冷卻多久才恢復自動同步
+const FULL_SYNC_INTERVAL_MS = 10 * 60 * 1000;  // 完整(跨裝置合併)同步的保底週期
 let RESOLVED_GIST_ID = null;   // 這次頁面載入期間快取住,避免每次 push 都重新驗證一次
-let SYNC_IN_FLIGHT = null;     // 進行中的 cloudSync() promise,避免同時重疊觸發(例如 visible + 手動按鈕)
+let SYNC_IN_FLIGHT = null;     // 進行中的同步 promise,避免同時重疊觸發(例如 visible + 手動按鈕)
 
 function getGhToken() {
   return localStorage.getItem(GH_TOKEN_KEY) || '';
@@ -456,7 +463,9 @@ function mergeStates(a, b) {
 
 // 完整同步一次:拉雲端 → 跟本機逐卡合併 → 合併結果存回本機也存回雲端。
 // 回傳本機資料是否因此有變動(給呼叫端決定要不要重畫畫面)。
-async function cloudSync() {
+// 只在真的需要跨裝置合併的時機呼叫(剛連接/手動按鈕/分頁切回前景/定期保底),
+// 平常每題作答的同步請走下面的 cloudSyncLight,不需要每次都整包重抓。
+async function cloudSyncFull() {
   if (SYNC_IN_FLIGHT) return SYNC_IN_FLIGHT;
   SYNC_IN_FLIGHT = (async () => {
     const gistId = await resolveGistId();
@@ -504,69 +513,159 @@ async function cloudSync() {
   }
 }
 
-// 每次 saveState() 都會呼叫這裡。原本是等變動停止 2 秒後才送出去(debounce),
-// 但手機瀏覽器把 app 切到背景/關掉的速度常常比這 2 秒還快,還沒送出就被系統中斷,
-// 結果「學習中/已學會」這種在快速連續作答後就切走的進度,實際上從來沒推上雲端過
-// (相對地,設定頁的變動因為使用者會留在畫面上看儲存成功的提示,debounce 才有機會
-// 跑完,所以才會出現「只有設定同步了」的現象)。
-// 改成立刻嘗試同步、不再等待;靠 cloudSync() 自己的 SYNC_IN_FLIGHT 避免同時重疊
-// 送出,如果同步進行中又有新的變動,結束後會再補跑一次,不會漏掉。
+// 輕量同步:只把目前本機 STATE 直接 PATCH 上去,不重新 GET+合併雲端內容。
+// 平常每答一題就會呼叫到這裡(經過 debounce),這樣才不會每題都打兩次 API。
+// 跨裝置的合併交給 cloudSyncFull 在其他時機(見上面註解)處理。
+async function cloudSyncLight() {
+  if (SYNC_IN_FLIGHT) return SYNC_IN_FLIGHT;
+  SYNC_IN_FLIGHT = (async () => {
+    const gistId = await resolveGistId();
+    await ghApi('/gists/' + gistId, {
+      method: 'PATCH',
+      body: JSON.stringify({ files: { [GIST_FILENAME]: { content: JSON.stringify(STATE) } } }),
+    });
+    localStorage.setItem(GH_LAST_SYNC_KEY, String(Date.now()));
+    return false;
+  })();
+  try {
+    return await SYNC_IN_FLIGHT;
+  } finally {
+    SYNC_IN_FLIGHT = null;
+  }
+}
+
+/* -------- 限流冷卻 + 最近同步錯誤紀錄 -------- */
+function getCooldownUntil() {
+  const v = Number(localStorage.getItem(GH_COOLDOWN_KEY) || 0);
+  return v > Date.now() ? v : 0;
+}
+function setCooldown(ms) {
+  localStorage.setItem(GH_COOLDOWN_KEY, String(Date.now() + ms));
+}
+function clearCooldown() {
+  localStorage.removeItem(GH_COOLDOWN_KEY);
+}
+function isRateLimitError(err) {
+  return !!err && (err.status === 403 || err.status === 429);
+}
+function classifySyncError(err) {
+  if (isRateLimitError(err)) return '被 GitHub 限流';
+  if (err && err.status === 401) return 'token 無效或已過期';
+  if (err && err.status === 404) return '找不到同步用的 Gist';
+  if (err && typeof err.status === 'number') return 'GitHub 錯誤(' + err.status + ')';
+  return '網路連線失敗';
+}
+function getSyncLog() {
+  try { return JSON.parse(localStorage.getItem(GH_SYNC_LOG_KEY) || '[]'); } catch (e) { return []; }
+}
+function addSyncLogEntry(reason) {
+  const log = getSyncLog();
+  log.unshift({ t: Date.now(), reason });
+  if (log.length > SYNC_LOG_MAX) log.length = SYNC_LOG_MAX;
+  localStorage.setItem(GH_SYNC_LOG_KEY, JSON.stringify(log));
+  renderSyncLog();
+}
+// 統一的自動同步失敗處理:記錄一筆簡短紀錄,踩到限流就冷卻一段時間、
+// 冷卻期間完全不再嘗試(本機進度不受影響),冷卻剛開始時才跳一次短 toast 提醒,
+// 不會每答一題就跳一次又長又難懂的原始錯誤訊息。
+function handleSyncError(err) {
+  const reason = classifySyncError(err);
+  addSyncLogEntry(reason);
+  if (isRateLimitError(err)) {
+    const wasAlreadyCoolingDown = !!getCooldownUntil();
+    setCooldown(RATE_LIMIT_COOLDOWN_MS);
+    if (!wasAlreadyCoolingDown) {
+      showToast('雲端同步被限流,已暫停約 ' + Math.round(RATE_LIMIT_COOLDOWN_MS / 60000) + ' 分鐘,本機進度不受影響', 4000);
+    }
+  } else {
+    showToast('雲端同步失敗:' + reason, 4000);
+  }
+  renderSyncStatus();
+}
+
+// 每次 saveState() 都會呼叫這裡。原本是每次變動都立刻送出去(commit 638e91c 為了
+// 避免手機切背景太快、debounce 還沒跑完就被中斷),但代價是背一個字就打兩次 API
+// (GET+PATCH),背個五六十字很容易踩到 GitHub 的短時間高頻寫入限流。
+// 現在改成:平常作答用 debounce(停下來 SYNC_DEBOUNCE_MS 才送,且只做輕量 PATCH,
+// 不重新 GET+合併),真正「來不及等」的切背景/關頁面則由 flushCloudSync 立刻補送,
+// 兩者合起來就不會漏進度、頻率又降下來了。
 let SYNC_DIRTY = false;
 let SYNC_LOOP_RUNNING = false;
+let SYNC_DEBOUNCE_TIMER = null;
+let SYNC_DEBOUNCE_FIRST_AT = 0;
 function scheduleCloudSync() {
   if (!getGhToken()) return;
   SYNC_DIRTY = true;
-  runCloudSyncLoop();
+  const now = Date.now();
+  if (!SYNC_DEBOUNCE_FIRST_AT) SYNC_DEBOUNCE_FIRST_AT = now;
+  clearTimeout(SYNC_DEBOUNCE_TIMER);
+  // 連續作答停不下來的話,最多等 SYNC_DEBOUNCE_MAX_WAIT_MS 還是會送一次,不會無限延後。
+  const delay = (now - SYNC_DEBOUNCE_FIRST_AT >= SYNC_DEBOUNCE_MAX_WAIT_MS) ? 0 : SYNC_DEBOUNCE_MS;
+  SYNC_DEBOUNCE_TIMER = setTimeout(runCloudSyncLoop, delay);
 }
 async function runCloudSyncLoop() {
   if (SYNC_LOOP_RUNNING) return;
   SYNC_LOOP_RUNNING = true;
   while (SYNC_DIRTY) {
     SYNC_DIRTY = false;
+    SYNC_DEBOUNCE_FIRST_AT = 0;
+    if (getCooldownUntil()) break; // 冷卻中就完全不嘗試,本機進度不受影響
     try {
-      const changed = await cloudSync();
-      if (changed) renderAll();
+      await cloudSyncLight();
       renderSyncStatus();
     } catch (err) {
       console.error(err);
-      showToast('雲端同步失敗:' + err.message, 6000);
-      break; // 避免網路持續有問題時卡在無限重試迴圈,下次 saveState() 會再自然觸發一次
+      handleSyncError(err);
+      break; // 避免網路/限流持續有問題時卡在無限重試迴圈,下次 saveState() 會再自然觸發一次
     }
   }
   SYNC_LOOP_RUNNING = false;
 }
 
+// 每隔 FULL_SYNC_INTERVAL_MS 保底做一次完整(GET+合併)同步,確保就算分頁一直開著
+// 不曾切背景/切回前景,其他裝置的進度還是會定期合併進來。
+setInterval(() => {
+  if (!getGhToken() || SYNC_IN_FLIGHT || getCooldownUntil()) return;
+  cloudSyncFull().then(changed => {
+    if (changed) renderAll();
+    renderSyncStatus();
+  }).catch(err => { console.error(err); handleSyncError(err); });
+}, FULL_SYNC_INTERVAL_MS);
+
 async function connectSync(token) {
   localStorage.setItem(GH_TOKEN_KEY, token);
   RESOLVED_GIST_ID = null;
   try {
-    await cloudSync();
+    await cloudSyncFull();
+    clearCooldown();
     showToast('雲端同步已連接 ✅');
     renderAll();
   } catch (e) {
     console.error(e);
+    addSyncLogEntry(classifySyncError(e));
     localStorage.removeItem(GH_TOKEN_KEY);
-    showToast('連接失敗:' + e.message, 6000);
+    showToast('連接失敗:' + classifySyncError(e), 4000);
   }
   renderSyncStatus();
 }
 
-// 切分頁/切 app、關分頁的瞬間,萬一還有變動沒送出(理論上 scheduleCloudSync 已經
-// 立刻在跑了),保險再確認一次有沒有卡住的同步要補跑。
+// 切分頁/切 app、關分頁的瞬間,萬一還有變動沒送出(debounce 還沒等到),
+// 立刻補跑一次,不等 debounce 的時間到。
 function flushCloudSync() {
   if (!getGhToken()) return;
+  clearTimeout(SYNC_DEBOUNCE_TIMER);
   runCloudSyncLoop();
 }
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') {
     flushCloudSync();
-  } else if (document.visibilityState === 'visible' && getGhToken()) {
-    // 分頁切回來時主動拉一次雲端 —— 不然像電腦分頁開一整天沒重新整理的情況,
+  } else if (document.visibilityState === 'visible' && getGhToken() && !getCooldownUntil()) {
+    // 分頁切回來時主動拉一次雲端(完整合併)—— 不然像電腦分頁開一整天沒重新整理的情況,
     // 手機那邊在別的時段唸的進度永遠不會出現在這台電腦上,直到手動重新整理。
-    cloudSync().then(changed => {
+    cloudSyncFull().then(changed => {
       if (changed) { renderAll(); showToast('已同步其他裝置的進度 ☁️'); }
       renderSyncStatus();
-    }).catch(err => console.error(err));
+    }).catch(err => { console.error(err); handleSyncError(err); });
   }
 });
 window.addEventListener('pagehide', flushCloudSync);
@@ -575,10 +674,32 @@ function disconnectSync() {
   localStorage.removeItem(GH_TOKEN_KEY);
   localStorage.removeItem(GH_GIST_ID_KEY);
   localStorage.removeItem(GH_LAST_SYNC_KEY);
+  localStorage.removeItem(GH_COOLDOWN_KEY);
   RESOLVED_GIST_ID = null;
   SYNC_DIRTY = false;
+  clearTimeout(SYNC_DEBOUNCE_TIMER);
   showToast('已取消雲端同步(本機進度不受影響)');
   renderSyncStatus();
+}
+
+function renderSyncLog() {
+  const el = document.getElementById('syncLogList');
+  if (!el) return;
+  const log = getSyncLog();
+  el.textContent = '';
+  if (!log.length) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = '目前沒有同步錯誤紀錄。';
+    el.appendChild(p);
+    return;
+  }
+  for (const entry of log) {
+    const p = document.createElement('p');
+    p.className = 'muted';
+    p.textContent = new Date(entry.t).toLocaleString() + ' — ' + entry.reason;
+    el.appendChild(p);
+  }
 }
 
 function renderSyncStatus() {
@@ -590,13 +711,20 @@ function renderSyncStatus() {
     disc.classList.add('hidden');
     conn.classList.remove('hidden');
     const last = localStorage.getItem(GH_LAST_SYNC_KEY);
-    document.getElementById('syncStatusText').textContent = last
+    let statusText = last
       ? '已連接 ✅ 上次同步:' + new Date(Number(last)).toLocaleString()
       : '已連接 ✅ 尚未同步過';
+    const cooldownUntil = getCooldownUntil();
+    if (cooldownUntil) {
+      const mins = Math.max(1, Math.ceil((cooldownUntil - Date.now()) / 60000));
+      statusText += ' ・ 目前被限流中,約 ' + mins + ' 分鐘後恢復自動同步';
+    }
+    document.getElementById('syncStatusText').textContent = statusText;
   } else {
     disc.classList.remove('hidden');
     conn.classList.add('hidden');
   }
+  renderSyncLog();
 }
 function resetDailyCounterIfNeeded() {
   const t = todayStr();
@@ -1136,13 +1264,14 @@ function bindStaticEvents() {
   });
   document.getElementById('syncNowBtn').addEventListener('click', () => {
     showToast('同步中…');
-    cloudSync().then(changed => {
+    cloudSyncFull().then(changed => {
       if (changed) renderAll();
+      clearCooldown();
       showToast('同步完成 ✅');
       renderSyncStatus();
     }).catch(err => {
       console.error(err);
-      showToast('同步失敗,請檢查網路或 token');
+      handleSyncError(err);
     });
   });
   document.getElementById('syncDisconnectBtn').addEventListener('click', () => {
@@ -1611,13 +1740,17 @@ async function init() {
   showCompanionLine('open');
   // 先用本機資料立刻畫面,雲端拉取放在背景做,拉到比較新的資料才整個重畫。
   if (getGhToken()) {
-    try {
-      const changed = await cloudSync();
-      if (changed) renderAll();
-      renderSyncStatus();
-    } catch (e) {
-      console.error(e);
-      showToast('雲端同步暫時失敗,先用本機進度');
+    if (getCooldownUntil()) {
+      renderSyncStatus(); // 冷卻中就不嘗試,直接用本機資料,狀態列會顯示還要等多久
+    } else {
+      try {
+        const changed = await cloudSyncFull();
+        if (changed) renderAll();
+        renderSyncStatus();
+      } catch (e) {
+        console.error(e);
+        handleSyncError(e);
+      }
     }
   }
 }
