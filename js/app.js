@@ -1533,6 +1533,7 @@ function startVerbQuestion() {
   document.getElementById('vcInputRow').classList.remove('hidden');
   document.getElementById('vcFeedback').classList.add('hidden');
   document.getElementById('vcHintPanel').classList.add('hidden');
+  document.getElementById('vcHintBtn').classList.remove('hidden');
   document.getElementById('vcAnswerInput').focus();
 }
 
@@ -1544,18 +1545,27 @@ function isVerbAnswerCorrect(val) {
   return kanji != null && val === kanji;
 }
 
-// 按提示不計入作答、不影響連續對答/正確率,純粹顯示說明,可以按幾次都沒關係。
+// 按提示不計入作答、不影響連續對答/正確率,純粹顯示說明。按下後提示取代按鈕
+// 顯示在原本按鈕的位置(句子跟輸入框中間),不跟按鈕併排,避免太擠。
 function showVerbHint() {
   if (!VC_CURRENT) return;
   const hint = buildVerbHint(VC_CURRENT.verb, VC_CURRENT.formId);
-  let text = `這是「${hint.groupLabel}」。`;
-  if (hint.demoWord) {
-    const formLabel = CONJ_FORMS.find(f => f.id === VC_CURRENT.formId).label;
-    text += `示範:${hint.demoWord} → ${hint.demoAnswer}(${formLabel})`;
-  }
-  if (hint.note) text += ' ' + hint.note;
   const panel = document.getElementById('vcHintPanel');
-  panel.textContent = text;
+  panel.innerHTML = '';
+  const groupLine = document.createElement('div');
+  groupLine.textContent = hint.groupLabel;
+  panel.appendChild(groupLine);
+  if (hint.demoWord) {
+    const demoLine = document.createElement('div');
+    demoLine.textContent = `${hint.demoWord} → ${hint.demoAnswer}`;
+    panel.appendChild(demoLine);
+  }
+  if (hint.note) {
+    const noteLine = document.createElement('div');
+    noteLine.textContent = hint.note;
+    panel.appendChild(noteLine);
+  }
+  document.getElementById('vcHintBtn').classList.add('hidden');
   panel.classList.remove('hidden');
 }
 
