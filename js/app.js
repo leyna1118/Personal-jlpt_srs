@@ -1593,9 +1593,7 @@ function submitVerbAnswer(correct) {
   resultEl.className = 'feedback-result ' + (correct ? 'correct' : 'wrong');
   const answer = conjugate(VC_CURRENT.verb, VC_CURRENT.formId);
   document.getElementById('vcAnswerWord').textContent = VC_CURRENT.template.replace('{blank}', answer);
-  const kanji = conjugateKanji(VC_CURRENT.verb, VC_CURRENT.formId);
-  const kanjiNote = (kanji && kanji !== answer) ? `(漢字也可以寫成:${kanji})` : '';
-  document.getElementById('vcAnswerGroup').textContent = `${VC_CURRENT.verb.word} → ${verbGroupLabel(VC_CURRENT.verb)}${kanjiNote}`;
+  document.getElementById('vcAnswerGroup').textContent = `${VC_CURRENT.verb.word} → ${verbGroupLabel(VC_CURRENT.verb)}`;
 }
 
 function bindVerbDrillEvents() {
